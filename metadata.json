@@ -1,0 +1,6 @@
+{
+  "name": "PocketVR Play Hub",
+  "description": "Android VR Play Store launcher, curved theater, and compass/IMU sensor-fusion gaming hub.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
