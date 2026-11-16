@@ -15,10 +15,134 @@
     />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
-    <link rel="stylesheet" href="/src/index.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #060914;
+        color: #f8fafc;
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        overflow: hidden;
+      }
+      #vr-boot-status {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 24px;
+        text-align: center;
+        background: radial-gradient(circle at 50% 35%, #0f1b3d, #060914 70%);
+        z-index: 5;
+      }
+      #vr-boot-status h2 {
+        margin: 0;
+        font-size: 1.35rem;
+        color: #38bdf8;
+      }
+      #vr-boot-status p {
+        margin: 0;
+        max-width: 520px;
+        font-size: 0.92rem;
+        line-height: 1.45;
+        color: #cbd5e1;
+      }
+      #vr-boot-status code {
+        background: rgba(148, 163, 184, 0.16);
+        padding: 2px 6px;
+        border-radius: 6px;
+        color: #e2e8f0;
+      }
+    </style>
+    <link rel="stylesheet" href="./src/index.css" />
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/index.ts"></script>
+    <div id="vr-boot-status">
+      <h2>Loading PocketVR Play Hub…</h2>
+      <p id="vr-boot-hint">
+        Initializing 3D WebXR engine &amp; spatial Play Store.
+      </p>
+    </div>
+    <script>
+      (function () {
+        var redirected = false;
+        function isRawSourceBuild() {
+          var scripts = document.getElementsByTagName('script');
+          for (var i = 0; i < scripts.length; i++) {
+            var src = scripts[i].getAttribute('src') || '';
+            if (src.indexOf('src/index.ts') !== -1) return true;
+          }
+          return false;
+        }
+
+        function tryRedirectToDocs() {
+          if (redirected || window.__pocketVrBooted || !isRawSourceBuild()) return;
+          redirected = true;
+          fetch('./docs/index.html', {method: 'HEAD'})
+            .then(function (res) {
+              if (res.ok) {
+                window.location.replace(
+                  './docs/' + window.location.search + window.location.hash
+                );
+              }
+            })
+            .catch(function () {});
+        }
+
+        var timer = setTimeout(function () {
+          var el = document.getElementById('vr-boot-hint');
+          if (!el || window.__pocketVrBooted) return;
+          if (isRawSourceBuild()) {
+            tryRedirectToDocs();
+            el.innerHTML =
+              'Uncompiled source detected on static hosting. Opening prebuilt bundle in <code>./docs/</code> or enable GitHub Actions in <strong>Settings → Pages</strong>.';
+          } else {
+            el.textContent =
+              'Still initializing 3D WebXR scene. Ensure WebGL is enabled in your browser.';
+          }
+        }, 4000);
+
+        window.addEventListener(
+          'error',
+          function (e) {
+            if (window.__pocketVrBooted) return;
+            var target = e && e.target;
+            var targetSrc =
+              target && target.getAttribute ? target.getAttribute('src') || '' : '';
+            if (targetSrc.indexOf('src/index.ts') !== -1) {
+              tryRedirectToDocs();
+              return;
+            }
+            var el = document.getElementById('vr-boot-hint');
+            if (el && e && e.message) {
+              el.textContent = 'Startup error: ' + e.message;
+            }
+          },
+          true
+        );
+
+        window.addEventListener('unhandledrejection', function (e) {
+          var el = document.getElementById('vr-boot-hint');
+          if (el && !window.__pocketVrBooted && e && e.reason) {
+            var msg = e.reason.message ? e.reason.message : String(e.reason);
+            el.textContent = 'Startup error: ' + msg;
+          }
+        });
+
+        window.__clearPocketVrBootTimer = function () {
+          clearTimeout(timer);
+          window.__pocketVrBooted = true;
+          var box = document.getElementById('vr-boot-status');
+          if (box) box.remove();
+        };
+      })();
+    </script>
+    <script type="module" src="./src/index.ts"></script>
   </body>
 </html>

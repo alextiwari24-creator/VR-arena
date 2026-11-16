@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>PocketVR Play Hub</title>
+    <meta
+      name="description"
+      content="Android VR Play Store launcher, curved theater, and compass/IMU sensor-fusion gaming hub."
+    />
+    <meta property="og:title" content="PocketVR Play Hub" />
+    <meta
+      property="og:description"
+      content="Android VR Play Store launcher, curved theater, and compass/IMU sensor-fusion gaming hub."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <style>html,body{color:#f8fafc;background:#060914;width:100%;height:100%;margin:0;padding:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}#vr-boot-status{text-align:center;z-index:5;background:radial-gradient(circle at 50% 35%,#0f1b3d,#060914 70%);flex-direction:column;justify-content:center;align-items:center;gap:10px;padding:24px;display:flex;position:fixed;inset:0}#vr-boot-status h2{color:#38bdf8;margin:0;font-size:1.35rem}#vr-boot-status p{color:#cbd5e1;max-width:520px;margin:0;font-size:.92rem;line-height:1.45}#vr-boot-status code{color:#e2e8f0;background:#94a3b829;border-radius:6px;padding:2px 6px}</style>
+    <script type="module" crossorigin src="./assets/index-BVcQDPu8.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/three.core-By8EEvyZ.js">
+    <link rel="modulepreload" crossorigin href="./assets/BufferGeometryUtils-BYSaMalx.js">
+    <link rel="modulepreload" crossorigin href="./assets/HandPoses-DaabQczj.js">
+    <link rel="modulepreload" crossorigin href="./assets/ThreeDisposal-ByyJ91mK.js">
+    <link rel="modulepreload" crossorigin href="./assets/Pass-DKy7_IVT.js">
+    <link rel="modulepreload" crossorigin href="./assets/preload-helper-DclECHGd.js">
+    <link rel="modulepreload" crossorigin href="./assets/ModelLoader-fPwYyvGW.js">
+    <link rel="modulepreload" crossorigin href="./assets/UITextInput-C-YaaCMx.js">
+    <link rel="modulepreload" crossorigin href="./assets/PanelMaterialFactory-UFQJamZF.js">
+    <link rel="modulepreload" crossorigin href="./assets/three.module-BQHlwFY1.js">
+    <link rel="modulepreload" crossorigin href="./assets/vision_bundle-DAsHxvux.js">
+    <link rel="stylesheet" crossorigin href="./assets/index-BsHZqhMj.css">
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="vr-boot-status">
+      <h2>Loading PocketVR Play Hub…</h2>
+      <p id="vr-boot-hint">
+        Initializing 3D WebXR engine &amp; spatial Play Store.
+      </p>
+    </div>
+    <script>
+      (function () {
+        var redirected = false;
+        function isRawSourceBuild() {
+          var scripts = document.getElementsByTagName('script');
+          for (var i = 0; i < scripts.length; i++) {
+            var src = scripts[i].getAttribute('src') || '';
+            if (src.indexOf('src/index.ts') !== -1) return true;
+          }
+          return false;
+        }
+
+        function tryRedirectToDocs() {
+          if (redirected || window.__pocketVrBooted || !isRawSourceBuild()) return;
+          redirected = true;
+          fetch('./docs/index.html', {method: 'HEAD'})
+            .then(function (res) {
+              if (res.ok) {
+                window.location.replace(
+                  './docs/' + window.location.search + window.location.hash
+                );
+              }
+            })
+            .catch(function () {});
+        }
+
+        var timer = setTimeout(function () {
+          var el = document.getElementById('vr-boot-hint');
+          if (!el || window.__pocketVrBooted) return;
+          if (isRawSourceBuild()) {
+            tryRedirectToDocs();
+            el.innerHTML =
+              'Uncompiled source detected on static hosting. Opening prebuilt bundle in <code>./docs/</code> or enable GitHub Actions in <strong>Settings → Pages</strong>.';
+          } else {
+            el.textContent =
+              'Still initializing 3D WebXR scene. Ensure WebGL is enabled in your browser.';
+          }
+        }, 4000);
+
+        window.addEventListener(
+          'error',
+          function (e) {
+            if (window.__pocketVrBooted) return;
+            var target = e && e.target;
+            var targetSrc =
+              target && target.getAttribute ? target.getAttribute('src') || '' : '';
+            if (targetSrc.indexOf('src/index.ts') !== -1) {
+              tryRedirectToDocs();
+              return;
+            }
+            var el = document.getElementById('vr-boot-hint');
+            if (el && e && e.message) {
+              el.textContent = 'Startup error: ' + e.message;
+            }
+          },
+          true
+        );
+
+        window.addEventListener('unhandledrejection', function (e) {
+          var el = document.getElementById('vr-boot-hint');
+          if (el && !window.__pocketVrBooted && e && e.reason) {
+            var msg = e.reason.message ? e.reason.message : String(e.reason);
+            el.textContent = 'Startup error: ' + msg;
+          }
+        });
+
+        window.__clearPocketVrBootTimer = function () {
+          clearTimeout(timer);
+          window.__pocketVrBooted = true;
+          var box = document.getElementById('vr-boot-status');
+          if (box) box.remove();
+        };
+      })();
+    </script>
+  </body>
+</html>

@@ -1,6 +1,13 @@
 import * as xb from 'xrblocks';
 import {VRStoreHubApp} from './VRStoreHubApp.ts';
 
+declare global {
+  interface Window {
+    __clearPocketVrBootTimer?: () => void;
+    __pocketVrBooted?: boolean;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const options = new xb.Options();
   options.enableVR();
@@ -23,5 +30,17 @@ document.addEventListener('DOMContentLoaded', () => {
   );
 
   xb.add(new VRStoreHubApp());
-  void xb.init(options);
+  void xb
+    .init(options)
+    .then(() => {
+      window.__clearPocketVrBootTimer?.();
+    })
+    .catch((err: unknown) => {
+      const hint = document.getElementById('vr-boot-hint');
+      if (hint) {
+        hint.textContent = `XR initialization failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+      }
+    });
 });

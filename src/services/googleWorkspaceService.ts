@@ -20,8 +20,13 @@ export const SCOPES = [
   'https://www.googleapis.com/auth/contacts.readonly',
 ];
 
-const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
-const auth = getAuth(app);
+let auth: ReturnType<typeof getAuth> | null = null;
+try {
+  const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
+  auth = getAuth(app);
+} catch {
+  auth = null;
+}
 
 const provider = new GoogleAuthProvider();
 for (const scope of SCOPES) {
@@ -94,22 +99,32 @@ export function subscribeGoogleAuth(listener: AuthListener): () => void {
 export function ensureAuthInitialized(): void {
   if (authListenerInitialized) return;
   authListenerInitialized = true;
+  if (!auth) {
+    needsAuth = true;
+    notifyListeners();
+    return;
+  }
 
-  onAuthStateChanged(auth, (user) => {
-    currentUser = user;
-    if (user) {
-      if (cachedAccessToken) {
-        needsAuth = false;
-      } else if (!isSigningIn) {
+  try {
+    onAuthStateChanged(auth, (user) => {
+      currentUser = user;
+      if (user) {
+        if (cachedAccessToken) {
+          needsAuth = false;
+        } else if (!isSigningIn) {
+          cachedAccessToken = null;
+          needsAuth = true;
+        }
+      } else {
         cachedAccessToken = null;
         needsAuth = true;
       }
-    } else {
-      cachedAccessToken = null;
-      needsAuth = true;
-    }
+      notifyListeners();
+    });
+  } catch {
+    needsAuth = true;
     notifyListeners();
-  });
+  }
 }
 
 export async function signInWithGoogle(): Promise<{
@@ -117,6 +132,9 @@ export async function signInWithGoogle(): Promise<{
   accessToken: string;
 } | null> {
   ensureAuthInitialized();
+  if (!auth) {
+    throw new Error('Google sign-in unavailable in this browser environment.');
+  }
   if (isSigningIn) return null;
 
   try {
@@ -150,7 +168,9 @@ export async function signOutGoogle(): Promise<void> {
   cachedAccessToken = null;
   needsAuth = true;
   lastAuthError = '';
-  await auth.signOut();
+  if (auth) {
+    await auth.signOut();
+  }
   notifyListeners();
 }
 
