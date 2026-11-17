@@ -398,7 +398,14 @@ export const PLAY_STORE_CATALOG: PlayStoreAppItem[] = [
   },
 ];
 
-const iconCache = new Map<string, THREE.CanvasTexture>();
+const iconCache = new Map<string, THREE.Texture>();
+const MAX_PROC_ICONS = 32;
+let activeIconResolution = 128;
+
+export function setCatalogTextureResolution(size: 128 | 256): void {
+  if (activeIconResolution === size) return;
+  activeIconResolution = size;
+}
 
 const GOOGLE_GLYPH_MAP: Record<string, string> = {
   gmail: 'M',
@@ -420,19 +427,29 @@ const GOOGLE_GLYPH_MAP: Record<string, string> = {
 };
 
 /**
- * Generates a crisp procedural Play Store / Google app icon texture on an HTML5 canvas.
+ * Generates a crisp procedural Play Store / Google app icon texture on an HTML5 canvas
+ * at tier-adaptive POT resolution (128x128 on low-end / balanced GPUs -> 75% less VRAM)
+ * with LRU eviction and mipmap suppression for fixed UI panels.
  */
-export function getAppIconTexture(app: PlayStoreAppItem): THREE.CanvasTexture {
+export function getAppIconTexture(app: PlayStoreAppItem): THREE.Texture {
   const cached = iconCache.get(app.id);
-  if (cached) return cached;
+  if (cached) {
+    // Touch LRU order
+    iconCache.delete(app.id);
+    iconCache.set(app.id, cached);
+    return cached;
+  }
 
+  const size = activeIconResolution;
+  const s = size / 256;
   const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 256;
+  canvas.width = size;
+  canvas.height = size;
   const ctx = canvas.getContext('2d');
   if (ctx) {
+    ctx.save();
+    ctx.scale(s, s);
     if (app.category === 'google') {
-      // Crisp Google Material white-tile icon with 4-color Google border arc & colored center emblem
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, 256, 256);
 
@@ -467,7 +484,6 @@ export function getAppIconTexture(app: PlayStoreAppItem): THREE.CanvasTexture {
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 256);
 
-      // Subtle geometric grid overlay
       ctx.strokeStyle = 'rgba(255,255,255,0.16)';
       ctx.lineWidth = 2;
       for (let i = 32; i < 256; i += 48) {
@@ -503,21 +519,34 @@ export function getAppIconTexture(app: PlayStoreAppItem): THREE.CanvasTexture {
         .join('');
       ctx.fillText(initials || 'VR', 128, 130);
     }
+    ctx.restore();
   }
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
+  texture.generateMipmaps = false;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
   texture.needsUpdate = true;
+
+  if (iconCache.size >= MAX_PROC_ICONS) {
+    const oldestKey = iconCache.keys().next().value;
+    if (oldestKey) {
+      iconCache.get(oldestKey)?.dispose();
+      iconCache.delete(oldestKey);
+    }
+  }
   iconCache.set(app.id, texture);
   return texture;
 }
 
 const remoteIconCache = new Map<string, THREE.Texture>();
+const MAX_REMOTE_ICONS = 20;
 const textureLoader = new THREE.TextureLoader();
 
 /**
  * Loads a proxied real Google Play Store icon into a Three.js Texture when available,
- * resolving safely without failing if offline.
+ * enforcing bounded LRU caching and mipmap suppression to keep mobile VRAM low.
  */
 export function loadAppIconTextureAsync(
   app: PlayStoreAppItem,
@@ -526,6 +555,8 @@ export function loadAppIconTextureAsync(
   if (!app.iconUrl) return;
   const cached = remoteIconCache.get(app.iconUrl);
   if (cached) {
+    remoteIconCache.delete(app.iconUrl);
+    remoteIconCache.set(app.iconUrl, cached);
     onLoaded(cached);
     return;
   }
@@ -534,7 +565,18 @@ export function loadAppIconTextureAsync(
     app.iconUrl,
     (tex) => {
       tex.colorSpace = THREE.SRGBColorSpace;
+      tex.generateMipmaps = false;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
       tex.needsUpdate = true;
+
+      if (remoteIconCache.size >= MAX_REMOTE_ICONS) {
+        const oldestUrl = remoteIconCache.keys().next().value;
+        if (oldestUrl) {
+          remoteIconCache.get(oldestUrl)?.dispose();
+          remoteIconCache.delete(oldestUrl);
+        }
+      }
       remoteIconCache.set(app.iconUrl!, tex);
       onLoaded(tex);
     },
@@ -543,6 +585,39 @@ export function loadAppIconTextureAsync(
       // Keep procedural canvas fallback texture silently
     }
   );
+}
+
+/**
+ * Aggressively trims cached remote and procedural icon textures under memory pressure
+ * or when uninstalling apps from the VR launcher.
+ */
+export function trimCatalogTextureCache(aggressive = false): number {
+  let disposed = 0;
+  const targetRemote = aggressive ? 4 : Math.floor(MAX_REMOTE_ICONS / 2);
+  while (remoteIconCache.size > targetRemote) {
+    const oldest = remoteIconCache.keys().next().value;
+    if (!oldest) break;
+    remoteIconCache.get(oldest)?.dispose();
+    remoteIconCache.delete(oldest);
+    disposed += 1;
+  }
+  if (aggressive) {
+    while (iconCache.size > 10) {
+      const oldest = iconCache.keys().next().value;
+      if (!oldest) break;
+      iconCache.get(oldest)?.dispose();
+      iconCache.delete(oldest);
+      disposed += 1;
+    }
+  }
+  return disposed;
+}
+
+export function getCatalogTextureStats(): {proceduralCount: number; remoteCount: number} {
+  return {
+    proceduralCount: iconCache.size,
+    remoteCount: remoteIconCache.size,
+  };
 }
 
 export function disposeCatalogTextures(): void {

@@ -8,7 +8,11 @@ import {VRGameTheater} from './games/VRGameTheater.ts';
 import {HandGestureController, VRGestureAction} from './gestures/HandGestureController.ts';
 import {HeadGazeController} from './sensors/HeadGazeController.ts';
 import {SensorFusionTracker} from './sensors/SensorFusionTracker.ts';
-import {disposeCatalogTextures, PLAY_STORE_CATALOG} from './store/catalog.ts';
+import {
+  disposeCatalogTextures,
+  PLAY_STORE_CATALOG,
+  setCatalogTextureResolution,
+} from './store/catalog.ts';
 import {VirtualPlayStore} from './store/VirtualPlayStore.ts';
 import {PlayStoreAppItem} from './types.ts';
 import {mountGoogleSignInOverlay} from './ui/googleSignInOverlay.ts';
@@ -56,6 +60,8 @@ export class VRStoreHubApp extends xb.Script {
   private readonly _screenRayDir = new THREE.Vector3();
   private readonly _screenRayOrigin = new THREE.Vector3();
 
+  private unsubscribeTrim: (() => void) | null = null;
+
   init(): void {
     xb.ui.theme = 'grayGlass';
 
@@ -74,9 +80,19 @@ export class VRStoreHubApp extends xb.Script {
     );
     this.add(this.theater);
 
-    this.unsubscribeQuality = this.vrEngine.onQualityChange((_, profile) => {
-      this.env.setQualityProfile(profile);
-      this.theater.setQualityProfile(profile.screenRedrawHz, profile.maxBlasterTargets);
+    this.unsubscribeQuality = this.vrEngine.onQualityChange((tier, profile) => {
+      setCatalogTextureResolution(tier === 'high' ? 256 : 128);
+      this.env.setQualityProfile(profile, tier);
+      this.playground.setLodBias(profile.lodBias);
+      this.theater.setQualityProfile(
+        profile.screenRedrawHz,
+        profile.maxBlasterTargets,
+        profile.screenResolutionScale
+      );
+    });
+    this.unsubscribeTrim = this.vrEngine.registerMemoryTrimmer(() => {
+      this.env.releaseDormantResources();
+      return 0;
     });
 
     this.gestures = new HandGestureController(
@@ -561,6 +577,10 @@ export class VRStoreHubApp extends xb.Script {
     if (this.unsubscribeQuality) {
       this.unsubscribeQuality();
       this.unsubscribeQuality = null;
+    }
+    if (this.unsubscribeTrim) {
+      this.unsubscribeTrim();
+      this.unsubscribeTrim = null;
     }
     if (this.unmountGoogleOverlay) {
       this.unmountGoogleOverlay();

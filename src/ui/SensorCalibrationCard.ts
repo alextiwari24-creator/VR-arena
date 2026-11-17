@@ -19,6 +19,7 @@ export class SensorCalibrationCard extends xb.UICard {
   private chipsText: xb.UIText;
   private locoText: xb.UIText;
   private enginePerfText: xb.UIText;
+  private memoryPerfText: xb.UIText;
   private gestureText: xb.UIText;
   private fallbackHintText: xb.UIText;
 
@@ -36,6 +37,8 @@ export class SensorCalibrationCard extends xb.UICard {
   private testJumpBtn: xb.UIButton;
   private qualityBtn: xb.UIButton;
   private ipdBtn: xb.UIButton;
+  private trimMemBtn: xb.UIButton;
+  private benchBtn: xb.UIButton;
 
   private updateTimer = 0;
 
@@ -69,6 +72,10 @@ export class SensorCalibrationCard extends xb.UICard {
     const enginePerfText = new xb.UIText({
       text: 'VR Engine: 60 FPS • Balanced • DPR 1.0 • Mono',
       style: {fontSize: 11.5, fontWeight: 'bold', color: '#7dd3fc'},
+    });
+    const memoryPerfText = new xb.UIText({
+      text: 'GPU: 16-Bit • 0 tex • 0.0 MB VRAM • LOD H0/M0/L0',
+      style: {fontSize: 11, color: '#6ee7b7'},
     });
     const gestureText = new xb.UIText({
       text: 'Hands: Ready • Gesture: NONE • Head: --',
@@ -149,6 +156,16 @@ export class SensorCalibrationCard extends xb.UICard {
       icon: 'visibility',
       style: {flexGrow: 1},
     });
+    const trimMemBtn = new xb.UIButton({
+      label: 'Trim GC',
+      icon: 'cleaning_services',
+      style: {flexGrow: 1},
+    });
+    const benchBtn = new xb.UIButton({
+      label: 'Low-End Bench',
+      icon: 'assessment',
+      style: {flexGrow: 1},
+    });
 
     const smoothLabel = new xb.UIText({
       text: '34%',
@@ -191,6 +208,7 @@ export class SensorCalibrationCard extends xb.UICard {
       anglesText,
       chipsText,
       enginePerfText,
+      memoryPerfText,
       locoText,
       gestureText,
       fallbackHintText,
@@ -267,6 +285,10 @@ export class SensorCalibrationCard extends xb.UICard {
           children: [qualityBtn, ipdBtn],
         }),
         new xb.UIPanel({
+          style: {width: '100%', flexDirection: 'row', gap: 8},
+          children: [trimMemBtn, benchBtn],
+        }),
+        new xb.UIPanel({
           style: {
             width: '100%',
             flexDirection: 'row',
@@ -306,6 +328,7 @@ export class SensorCalibrationCard extends xb.UICard {
     this.anglesText = anglesText;
     this.chipsText = chipsText;
     this.enginePerfText = enginePerfText;
+    this.memoryPerfText = memoryPerfText;
     this.locoText = locoText;
     this.gestureText = gestureText;
     this.fallbackHintText = fallbackHintText;
@@ -323,6 +346,8 @@ export class SensorCalibrationCard extends xb.UICard {
     this.testJumpBtn = testJumpBtn;
     this.qualityBtn = qualityBtn;
     this.ipdBtn = ipdBtn;
+    this.trimMemBtn = trimMemBtn;
+    this.benchBtn = benchBtn;
 
     this.wireActions();
   }
@@ -465,6 +490,26 @@ export class SensorCalibrationCard extends xb.UICard {
       this.ipdBtn.label = `IPD: ${ipd}mm`;
       this.refreshTelemetry();
     };
+
+    this.trimMemBtn.onClick = () => {
+      if (!this.vrEngine) return;
+      this.sound.playClick();
+      const res = this.vrEngine.trimMemory(true);
+      this.trimMemBtn.label = `Trimmed (${res.texturesFreed})`;
+      this.refreshTelemetry();
+    };
+
+    this.benchBtn.onClick = () => {
+      if (!this.vrEngine) return;
+      this.sound.playClick();
+      this.benchBtn.disabled = true;
+      this.benchBtn.label = 'Testing Eco...';
+      void this.vrEngine.runLowEndStressBenchmark().then(() => {
+        this.benchBtn.disabled = false;
+        this.benchBtn.label = 'Low-End Bench';
+        this.refreshTelemetry();
+      });
+    };
   }
 
   private getCardinal(deg: number): string {
@@ -494,7 +539,10 @@ export class SensorCalibrationCard extends xb.UICard {
       const vt = this.vrEngine.getTelemetry();
       const eyeMode = vt.xrPresenting ? 'WebXR' : vt.stereoEnabled ? `SBS ${vt.ipdMm}mm` : 'Mono';
       this.enginePerfText.text =
-        `VR Engine: ${vt.fps} FPS (${vt.frameTimeMs}ms) • ${vt.effectiveTier.toUpperCase()} • DPR ${vt.pixelRatio} • ${vt.drawCalls} draws • ${eyeMode}`;
+        `VR: ${vt.fps} FPS (p95 ${vt.p95FrameMs}ms) • ${vt.effectiveTier.toUpperCase()} • DPR ${vt.pixelRatio} • ${vt.drawCalls} draws • ${eyeMode}`;
+      const heapStr = vt.jsHeapMb !== null ? ` • ${vt.jsHeapMb}MB JS` : '';
+      this.memoryPerfText.text =
+        `${vt.gpuCompression} • ${vt.texturesCount} tex (${vt.estimatedVramMb}MB) • LOD H${vt.lodCounts.high}/M${vt.lodCounts.mid}/L${vt.lodCounts.low}${heapStr} • ${vt.benchmarkSummary}`;
       const expectedStereo = vt.stereoEnabled ? 'SBS: ON' : 'SBS: OFF';
       if (this.stereoBtn.label !== expectedStereo) {
         this.stereoBtn.label = expectedStereo;

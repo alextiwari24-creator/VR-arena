@@ -66,6 +66,21 @@ export class HeadGazeController extends xb.Script {
   private readonly _box = new THREE.Box3();
   private readonly _rayHit = new THREE.Vector3();
   private readonly _hitBox = new THREE.Box3();
+  private readonly _bestUiPoint = new THREE.Vector3();
+  private readonly _bestUiBox = new THREE.Box3();
+  private readonly _bestUiHit: {
+    kind: 'button' | 'slider' | 'input' | 'scroll';
+    element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView;
+    point: THREE.Vector3;
+    distance: number;
+    box: THREE.Box3;
+  } = {
+    kind: 'button',
+    element: null as unknown as xb.UIButton,
+    point: this._bestUiPoint,
+    distance: 0,
+    box: this._bestUiBox,
+  };
 
   constructor(
     sensors: SensorFusionTracker,
@@ -302,9 +317,9 @@ export class HeadGazeController extends xb.Script {
       }
     }
 
-    // 3b. Floating 3D Playground toys & Cosmic Blaster drones
+    // 3b. Floating 3D Playground toys (THREE.LOD roots -> recursive=true skips invisible LOD tiers)
     if (!hitTarget && this.playground) {
-      const toyHits = this._raycaster.intersectObjects(this.playground.getTouchableMeshes(), false);
+      const toyHits = this._raycaster.intersectObjects(this.playground.getTouchableMeshes(), true);
       if (toyHits.length > 0 && toyHits[0].distance < bestDist) {
         bestDist = toyHits[0].distance;
         hitTarget = toyHits[0].object;
@@ -511,23 +526,12 @@ export class HeadGazeController extends xb.Script {
     }
   }
 
-  private findBestGazedUI(): {
-    kind: 'button' | 'slider' | 'input' | 'scroll';
-    element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView;
-    point: THREE.Vector3;
-    distance: number;
-    box: THREE.Box3;
-  } | null {
-    let best: {
-      kind: 'button' | 'slider' | 'input' | 'scroll';
-      element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView;
-      point: THREE.Vector3;
-      distance: number;
-      box: THREE.Box3;
-    } | null = null;
+  private findBestGazedUI(): typeof this._bestUiHit | null {
+    let found = false;
     let bestScoreDist = 6.5;
 
-    for (const root of this.interactiveRoots) {
+    for (let r = 0; r < this.interactiveRoots.length; r++) {
+      const root = this.interactiveRoots[r];
       if (!root.visible) continue;
       root.traverse((obj) => {
         if (!obj.visible) return;
@@ -554,19 +558,22 @@ export class HeadGazeController extends xb.Script {
           const priorityBias = kind === 'scroll' ? 0.14 : 0;
           if (dist + priorityBias < bestScoreDist) {
             bestScoreDist = dist + priorityBias;
-            best = {
-              kind,
-              element: obj as xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView,
-              point: hit.clone(),
-              distance: dist,
-              box: this._box.clone(),
-            };
+            found = true;
+            this._bestUiHit.kind = kind;
+            this._bestUiHit.element = obj as
+              | xb.UIButton
+              | xb.UISlider
+              | xb.UITextInput
+              | xb.UIScrollView;
+            this._bestUiPoint.copy(hit);
+            this._bestUiHit.distance = dist;
+            this._bestUiBox.copy(this._box);
           }
         }
       });
     }
 
-    return best;
+    return found ? this._bestUiHit : null;
   }
 
   getTelemetry(): HeadGazeTelemetry {

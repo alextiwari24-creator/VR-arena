@@ -5,7 +5,10 @@ import {SoundEngine} from '../audio/SoundEngine.ts';
 interface HoloToy {
   id: number;
   name: string;
-  mesh: THREE.Mesh;
+  lod: THREE.LOD;
+  highMesh: THREE.Mesh;
+  midMesh: THREE.Mesh;
+  lowMesh: THREE.Mesh;
   ring: THREE.Mesh;
   homePos: THREE.Vector3;
   velocity: THREE.Vector3;
@@ -18,18 +21,20 @@ interface HoloToy {
 
 /**
  * Floating 3D Holographic Air-Touch Playground inside VR reach space.
- * Lets the user touch, poke, spin, and chime 3D objects in mid-air via either
- * Back-Camera Hand Tracking or WebXR Hands/Controllers.
+ * Optimized with 3-tier THREE.LOD (High PBR+Ring -> Mid Lambert -> Low-Poly Basic proxy),
+ * shared materials/geometries across LOD tiers, and zero-allocation raycast/update paths.
  */
 export class AirTouchPlayground extends xb.Script {
   private readonly sound: SoundEngine;
   private toys: HoloToy[] = [];
+  private readonly touchableRoots: THREE.Object3D[] = [];
   private rippleMesh!: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>;
   private rippleLife = 0;
 
   private readonly disposables: Array<{dispose: () => void}> = [];
   private readonly _tmpVec = new THREE.Vector3();
   private elapsed = 0;
+  private lodBias = 1.0;
 
   constructor(sound: SoundEngine) {
     super();
@@ -41,44 +46,55 @@ export class AirTouchPlayground extends xb.Script {
       {
         name: 'Holo Crystal',
         pos: new THREE.Vector3(-0.34, 1.32, -0.72),
-        geo: new THREE.OctahedronGeometry(0.075, 0),
+        highGeo: new THREE.OctahedronGeometry(0.075, 1),
+        midGeo: new THREE.OctahedronGeometry(0.075, 0),
+        lowGeo: new THREE.TetrahedronGeometry(0.072, 0),
         color: 0x38bdf8,
       },
       {
         name: 'Quantum Cube',
         pos: new THREE.Vector3(0.0, 1.18, -0.68),
-        geo: new THREE.BoxGeometry(0.11, 0.11, 0.11),
+        highGeo: new THREE.BoxGeometry(0.11, 0.11, 0.11, 2, 2, 2),
+        midGeo: new THREE.BoxGeometry(0.11, 0.11, 0.11),
+        lowGeo: new THREE.BoxGeometry(0.105, 0.105, 0.105),
         color: 0xa855f7,
       },
       {
         name: 'Solar Orb',
         pos: new THREE.Vector3(0.34, 1.32, -0.72),
-        geo: new THREE.IcosahedronGeometry(0.075, 1),
+        highGeo: new THREE.IcosahedronGeometry(0.075, 2),
+        midGeo: new THREE.IcosahedronGeometry(0.075, 0),
+        lowGeo: new THREE.OctahedronGeometry(0.072, 0),
         color: 0xf472b6,
       },
       {
         name: 'Emerald Knot',
         pos: new THREE.Vector3(0.0, 1.56, -0.82),
-        geo: new THREE.TorusKnotGeometry(0.052, 0.017, 64, 10),
+        highGeo: new THREE.TorusKnotGeometry(0.052, 0.017, 64, 10),
+        midGeo: new THREE.TorusKnotGeometry(0.052, 0.017, 24, 5),
+        lowGeo: new THREE.OctahedronGeometry(0.068, 0),
         color: 0x34d399,
       },
     ];
 
-    const ringGeo = new THREE.TorusGeometry(0.115, 0.008, 10, 32);
+    const ringGeo = new THREE.TorusGeometry(0.115, 0.008, 8, 28);
     this.disposables.push(ringGeo);
 
     defs.forEach((def, idx) => {
-      const mat = new THREE.MeshStandardMaterial({
+      // LOD 0: Full PBR Material + Glowing Holo Ring (< 1.35m)
+      const highMat = new THREE.MeshStandardMaterial({
         color: def.color,
         emissive: def.color,
         emissiveIntensity: 0.45,
         roughness: 0.2,
         metalness: 0.75,
       });
-      const mesh = new THREE.Mesh(def.geo, mat);
-      mesh.position.copy(def.pos);
-      mesh.name = def.name;
-      mesh.userData.airTouchId = idx;
+      const highGroup = new THREE.Group();
+      highGroup.userData.airTouchId = idx;
+
+      const highMesh = new THREE.Mesh(def.highGeo, highMat);
+      highMesh.name = def.name;
+      highMesh.userData.airTouchId = idx;
 
       const ringMat = new THREE.MeshBasicMaterial({
         color: def.color,
@@ -88,15 +104,45 @@ export class AirTouchPlayground extends xb.Script {
       const ring = new THREE.Mesh(ringGeo, ringMat);
       ring.rotation.x = Math.PI / 2;
       ring.xb = {pointerEvents: 'none'};
-      mesh.add(ring);
+      highGroup.add(highMesh, ring);
 
-      this.add(mesh);
-      this.disposables.push(def.geo, mat, ringMat);
+      // LOD 1: Mid-poly diffuse Lambert shader (no PBR env map lookup, >= 1.35m)
+      const midMat = new THREE.MeshLambertMaterial({
+        color: def.color,
+        emissive: def.color,
+        emissiveIntensity: 0.3,
+      });
+      const midMesh = new THREE.Mesh(def.midGeo, midMat);
+      midMesh.name = def.name;
+      midMesh.userData.airTouchId = idx;
+
+      // LOD 2: Ultra-low-poly unlit Basic proxy (>= 2.8m)
+      const lowMat = new THREE.MeshBasicMaterial({
+        color: def.color,
+      });
+      const lowMesh = new THREE.Mesh(def.lowGeo, lowMat);
+      lowMesh.name = def.name;
+      lowMesh.userData.airTouchId = idx;
+
+      const lod = new THREE.LOD();
+      lod.position.copy(def.pos);
+      lod.name = def.name;
+      lod.userData.airTouchId = idx;
+      lod.addLevel(highGroup, 0);
+      lod.addLevel(midMesh, 1.35);
+      lod.addLevel(lowMesh, 2.8);
+
+      this.add(lod);
+      this.touchableRoots.push(lod);
+      this.disposables.push(def.highGeo, def.midGeo, def.lowGeo, highMat, midMat, lowMat, ringMat);
 
       this.toys.push({
         id: idx,
         name: def.name,
-        mesh,
+        lod,
+        highMesh,
+        midMesh,
+        lowMesh,
         ring,
         homePos: def.pos.clone(),
         velocity: new THREE.Vector3(),
@@ -108,7 +154,7 @@ export class AirTouchPlayground extends xb.Script {
       });
     });
 
-    const rippleGeo = new THREE.RingGeometry(0.04, 0.065, 32);
+    const rippleGeo = new THREE.RingGeometry(0.04, 0.065, 24);
     const rippleMat = new THREE.MeshBasicMaterial({
       color: 0x5eead4,
       transparent: true,
@@ -125,18 +171,19 @@ export class AirTouchPlayground extends xb.Script {
   onSelectStart(event: xb.SelectEvent): void {
     const toy = this.findToyByObject(event.target as THREE.Object3D | undefined);
     if (!toy) return;
-    const hitPoint = event.intersection?.point ?? toy.mesh.position;
+    const hitPoint = event.intersection?.point ?? toy.lod.position;
     this.triggerToyTouch(toy, hitPoint);
     event.stopPropagation();
   }
 
   public getTouchableMeshes(): THREE.Object3D[] {
-    return this.toys.map((t) => t.mesh);
+    return this.touchableRoots;
   }
 
   public setHoveredObject(obj: THREE.Object3D | null): void {
-    for (const toy of this.toys) {
-      toy.hovered = obj === toy.mesh;
+    const hitToy = this.findToyByObject(obj ?? undefined);
+    for (let i = 0; i < this.toys.length; i++) {
+      this.toys[i].hovered = this.toys[i] === hitToy;
     }
   }
 
@@ -154,9 +201,10 @@ export class AirTouchPlayground extends xb.Script {
   }
 
   public checkDirectFingertipTouch(worldPoint: THREE.Vector3, touchRadius = 0.11): string | null {
-    for (const toy of this.toys) {
-      if (worldPoint.distanceTo(toy.mesh.position) <= touchRadius) {
-        this._tmpVec.copy(toy.mesh.position).sub(worldPoint).normalize();
+    for (let i = 0; i < this.toys.length; i++) {
+      const toy = this.toys[i];
+      if (worldPoint.distanceTo(toy.lod.position) <= touchRadius) {
+        this._tmpVec.copy(toy.lod.position).sub(worldPoint).normalize();
         return this.triggerToyTouch(toy, worldPoint, this._tmpVec);
       }
     }
@@ -208,34 +256,66 @@ export class AirTouchPlayground extends xb.Script {
     return toy.name;
   }
 
+  public setLodBias(bias: number): void {
+    const b = Math.max(0.4, bias);
+    if (Math.abs(b - this.lodBias) < 0.02) return;
+    this.lodBias = b;
+    for (let i = 0; i < this.toys.length; i++) {
+      const levels = this.toys[i].lod.levels;
+      if (levels.length >= 3) {
+        levels[1].distance = 1.35 * b;
+        levels[2].distance = 2.8 * b;
+      }
+    }
+  }
+
+  public updateLODs(camera: THREE.Camera, outCounts?: {high: number; mid: number; low: number}): void {
+    for (let i = 0; i < this.toys.length; i++) {
+      const lod = this.toys[i].lod;
+      lod.update(camera);
+      if (outCounts) {
+        const level = lod.getCurrentLevel();
+        if (level === 0) outCounts.high += 1;
+        else if (level === 1) outCounts.mid += 1;
+        else outCounts.low += 1;
+      }
+    }
+  }
+
   update(): void {
     const dt = Math.min(xb.getDeltaTime(), 0.05);
     this.elapsed += dt;
 
-    for (const toy of this.toys) {
+    if (xb.core.camera) {
+      this.updateLODs(xb.core.camera);
+    }
+
+    for (let i = 0; i < this.toys.length; i++) {
+      const toy = this.toys[i];
       const floatY = Math.sin(this.elapsed * 1.8 + toy.id * 1.5) * 0.025;
-      // Spring return to home position
       this._tmpVec.copy(toy.homePos);
       this._tmpVec.y += floatY;
-      this._tmpVec.sub(toy.mesh.position).multiplyScalar(7.5 * dt);
+      this._tmpVec.sub(toy.lod.position).multiplyScalar(7.5 * dt);
       toy.velocity.add(this._tmpVec);
       toy.velocity.multiplyScalar(Math.exp(-4.2 * dt));
-      toy.mesh.position.addScaledVector(toy.velocity, dt);
+      toy.lod.position.addScaledVector(toy.velocity, dt);
 
       toy.spinSpeed.lerp(this._tmpVec.set(0.35, 0.75, 0.2), dt * 1.6);
-      toy.mesh.rotation.x += toy.spinSpeed.x * dt;
-      toy.mesh.rotation.y += toy.spinSpeed.y * dt;
-      toy.mesh.rotation.z += toy.spinSpeed.z * dt;
-      toy.ring.rotation.z += dt * 1.4;
+      toy.lod.rotation.x += toy.spinSpeed.x * dt;
+      toy.lod.rotation.y += toy.spinSpeed.y * dt;
+      toy.lod.rotation.z += toy.spinSpeed.z * dt;
+      if (toy.ring.parent && toy.lod.getCurrentLevel() === 0) {
+        toy.ring.rotation.z += dt * 1.4;
+      }
 
       if (toy.flash > 0) {
         toy.flash = Math.max(0, toy.flash - dt * 2.5);
       }
 
       const targetScale = toy.hovered ? 1.24 : 1.0 + toy.flash * 0.25;
-      toy.mesh.scale.setScalar(THREE.MathUtils.lerp(toy.mesh.scale.x, targetScale, dt * 12));
+      toy.lod.scale.setScalar(THREE.MathUtils.lerp(toy.lod.scale.x, targetScale, dt * 12));
 
-      const mat = toy.mesh.material as THREE.MeshStandardMaterial;
+      const mat = toy.highMesh.material as THREE.MeshStandardMaterial;
       mat.emissiveIntensity = 0.45 + (toy.hovered ? 0.55 : 0) + toy.flash * 1.4;
       const ringMat = toy.ring.material as THREE.MeshBasicMaterial;
       ringMat.opacity = 0.35 + (toy.hovered ? 0.45 : 0) + toy.flash * 0.4;

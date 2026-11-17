@@ -170,6 +170,23 @@ export class HandGestureController extends xb.Script {
   private readonly _localHit = new THREE.Vector3();
   private readonly _box = new THREE.Box3();
   private readonly _rayHitVec = new THREE.Vector3();
+  private readonly _bestUiPoint = new THREE.Vector3();
+  private readonly _bestUiBox = new THREE.Box3();
+  private readonly _bestUiHit: {
+    kind: 'button' | 'slider' | 'input' | 'scroll' | 'card';
+    element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView | xb.UICard;
+    point: THREE.Vector3;
+    distance: number;
+    box: THREE.Box3;
+    directTouch: boolean;
+  } = {
+    kind: 'button',
+    element: null as unknown as xb.UIButton,
+    point: this._bestUiPoint,
+    distance: 0,
+    box: this._bestUiBox,
+    directTouch: false,
+  };
 
   private readonly handleXRGestureStart = (event: {
     detail: {hand: 'left' | 'right'; name: string; confidence?: number};
@@ -229,11 +246,12 @@ export class HandGestureController extends xb.Script {
     this.sound = sound ?? null;
 
     this.monitorCanvas = document.createElement('canvas');
-    this.monitorCanvas.width = 320;
-    this.monitorCanvas.height = 180;
-    this.monitorCtx = this.monitorCanvas.getContext('2d');
+    this.monitorCanvas.width = 256;
+    this.monitorCanvas.height = 144;
+    this.monitorCtx = this.monitorCanvas.getContext('2d', {alpha: false});
     this.monitorTexture = new THREE.CanvasTexture(this.monitorCanvas);
     this.monitorTexture.colorSpace = THREE.SRGBColorSpace;
+    this.monitorTexture.generateMipmaps = false;
     this.monitorTexture.minFilter = THREE.LinearFilter;
     this.monitorTexture.magFilter = THREE.LinearFilter;
     this.disposables.push(this.monitorTexture);
@@ -1028,7 +1046,7 @@ export class HandGestureController extends xb.Script {
     let bestHitDist = 3.8;
     let hoveredToyMesh: THREE.Object3D | null = null;
     if (this.playground) {
-      const toyHits = this._raycaster.intersectObjects(this.playground.getTouchableMeshes(), false);
+      const toyHits = this._raycaster.intersectObjects(this.playground.getTouchableMeshes(), true);
       if (toyHits.length > 0 && toyHits[0].distance < bestHitDist) {
         bestHitDist = toyHits[0].distance;
         hoveredToyMesh = toyHits[0].object;
@@ -1209,25 +1227,12 @@ export class HandGestureController extends xb.Script {
   private findBestUIHit(
     indexTipWorld: THREE.Vector3,
     maxDist: number
-  ): {
-    kind: 'button' | 'slider' | 'input' | 'scroll' | 'card';
-    element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView | xb.UICard;
-    point: THREE.Vector3;
-    distance: number;
-    box: THREE.Box3;
-    directTouch: boolean;
-  } | null {
-    let best: {
-      kind: 'button' | 'slider' | 'input' | 'scroll' | 'card';
-      element: xb.UIButton | xb.UISlider | xb.UITextInput | xb.UIScrollView | xb.UICard;
-      point: THREE.Vector3;
-      distance: number;
-      box: THREE.Box3;
-      directTouch: boolean;
-    } | null = null;
+  ): typeof this._bestUiHit | null {
+    let found = false;
     let bestScoreDist = maxDist;
 
-    for (const root of this.interactiveRoots) {
+    for (let r = 0; r < this.interactiveRoots.length; r++) {
+      const root = this.interactiveRoots[r];
       if (!root.visible) continue;
       root.traverse((obj) => {
         if (!obj.visible) return;
@@ -1263,25 +1268,24 @@ export class HandGestureController extends xb.Script {
           const priorityBias = kind === 'card' ? 0.16 : kind === 'scroll' ? 0.08 : 0;
           if (camDist + priorityBias < bestScoreDist) {
             bestScoreDist = camDist + priorityBias;
-            best = {
-              kind,
-              element: obj as
-                | xb.UIButton
-                | xb.UISlider
-                | xb.UITextInput
-                | xb.UIScrollView
-                | xb.UICard,
-              point: hitPt.clone(),
-              distance: camDist,
-              box: this._box.clone(),
-              directTouch,
-            };
+            found = true;
+            this._bestUiHit.kind = kind;
+            this._bestUiHit.element = obj as
+              | xb.UIButton
+              | xb.UISlider
+              | xb.UITextInput
+              | xb.UIScrollView
+              | xb.UICard;
+            this._bestUiPoint.copy(hitPt);
+            this._bestUiHit.distance = camDist;
+            this._bestUiBox.copy(this._box);
+            this._bestUiHit.directTouch = directTouch;
           }
         }
       });
     }
 
-    return best;
+    return found ? this._bestUiHit : null;
   }
 
   private dispatchGestureAction(

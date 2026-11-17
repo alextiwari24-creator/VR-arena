@@ -12,25 +12,35 @@ import {
 import {PlayableModeId, PlayStoreAppItem} from '../types.ts';
 
 interface SpaceTarget {
-  mesh: THREE.Group;
+  lod: THREE.LOD;
   angle: number;
   elevation: number;
   distance: number;
   speed: number;
   hp: number;
+  active: boolean;
 }
 
 interface LaserBolt {
   mesh: THREE.Mesh;
   velocity: THREE.Vector3;
   life: number;
+  active: boolean;
 }
 
 interface RacerObstacle {
   lane: number; // -1..1
   z: number; // 0 (horizon) .. 1 (player)
   isOrb: boolean;
+  active: boolean;
 }
+
+const LOGICAL_W = 1024;
+const LOGICAL_H = 512;
+const TARGET_POOL_SIZE = 14;
+const BOLT_POOL_SIZE = 24;
+const OBSTACLE_POOL_SIZE = 32;
+const BOLT_Z_AXIS = new THREE.Vector3(0, 0, 1);
 
 export class VRGameTheater extends xb.Script {
   private readonly env: VRLoungeEnvironment;
@@ -40,6 +50,10 @@ export class VRGameTheater extends xb.Script {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D | null;
   private screenTexture: THREE.CanvasTexture;
+  private canvasScale = 0.75; // Adapted dynamically: 0.5 Eco, 0.75 Balanced, 1.0 High
+
+  // Pre-cached gradients (eliminates per-frame CanvasGradient heap churn)
+  private gradientCache = new Map<string, CanvasGradient>();
 
   private activeApp: PlayStoreAppItem | null = null;
   private mode: 'hub' | PlayableModeId = 'hub';
@@ -62,14 +76,15 @@ export class VRGameTheater extends xb.Script {
     items: Array<{title: string; meta: string}>;
   } | null = null;
 
-  // Cosmic Blaster 3D state
+  // Cosmic Blaster 3D pre-allocated object pools (zero GC during gameplay)
   private gameGroup = new THREE.Group();
-  private targets: SpaceTarget[] = [];
-  private bolts: LaserBolt[] = [];
+  private targetPool: SpaceTarget[] = [];
+  private activeTargetCount = 0;
+  private boltPool: LaserBolt[] = [];
   private spawnTimer = 0;
   private targetGeo = new THREE.OctahedronGeometry(0.18, 0);
-  private targetRingGeo = new THREE.TorusGeometry(0.24, 0.022, 8, 24);
-  private boltGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.35, 8);
+  private targetRingGeo = new THREE.TorusGeometry(0.24, 0.022, 6, 18);
+  private boltGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.35, 6);
   private boltMat = new THREE.MeshBasicMaterial({color: 0x38bdf8});
   private targetMat = new THREE.MeshStandardMaterial({
     color: 0xf43f5e,
@@ -78,13 +93,14 @@ export class VRGameTheater extends xb.Script {
     roughness: 0.25,
     metalness: 0.5,
   });
+  private targetLowMat = new THREE.MeshBasicMaterial({color: 0xf43f5e});
   private targetRingMat = new THREE.MeshBasicMaterial({color: 0x38bdf8});
 
-  // Neon Racer state
+  // Neon Racer pre-allocated obstacle pool (zero GC)
   private racerX = 0; // -1..1
   private racerSpeed = 0.65;
   private racerRoadScroll = 0;
-  private racerObstacles: RacerObstacle[] = [];
+  private racerObstaclePool: RacerObstacle[] = [];
   private racerSpawnTimer = 0;
   private racerFlash = 0;
 
@@ -112,17 +128,73 @@ export class VRGameTheater extends xb.Script {
     this.onSessionChange = onSessionChange;
 
     this.canvas = document.createElement('canvas');
-    this.canvas.width = 1024;
-    this.canvas.height = 512;
-    this.ctx = this.canvas.getContext('2d');
+    this.canvas.width = Math.round(LOGICAL_W * this.canvasScale);
+    this.canvas.height = Math.round(LOGICAL_H * this.canvasScale);
+    this.ctx = this.canvas.getContext('2d', {alpha: false});
     this.screenTexture = new THREE.CanvasTexture(this.canvas);
     this.screenTexture.colorSpace = THREE.SRGBColorSpace;
+    this.screenTexture.generateMipmaps = false;
     this.screenTexture.minFilter = THREE.LinearFilter;
     this.screenTexture.magFilter = THREE.LinearFilter;
+
+    this.initPools();
+  }
+
+  private initPools(): void {
+    this.boltGeo.rotateX(Math.PI / 2);
+
+    for (let i = 0; i < TARGET_POOL_SIZE; i++) {
+      const lod = new THREE.LOD();
+      lod.xb = {pointerEvents: 'none'};
+      lod.visible = false;
+
+      const highGroup = new THREE.Group();
+      const core = new THREE.Mesh(this.targetGeo, this.targetMat);
+      const ring = new THREE.Mesh(this.targetRingGeo, this.targetRingMat);
+      ring.rotation.x = Math.PI / 3;
+      highGroup.add(core, ring);
+
+      const farProxy = new THREE.Mesh(this.targetGeo, this.targetLowMat);
+
+      lod.addLevel(highGroup, 0);
+      lod.addLevel(farProxy, 3.6);
+
+      this.gameGroup.add(lod);
+      this.targetPool.push({
+        lod,
+        angle: 0,
+        elevation: 1.5,
+        distance: 3.0,
+        speed: 0.3,
+        hp: 1,
+        active: false,
+      });
+    }
+
+    for (let i = 0; i < BOLT_POOL_SIZE; i++) {
+      const mesh = new THREE.Mesh(this.boltGeo, this.boltMat);
+      mesh.xb = {pointerEvents: 'none'};
+      mesh.visible = false;
+      this.gameGroup.add(mesh);
+      this.boltPool.push({
+        mesh,
+        velocity: new THREE.Vector3(),
+        life: 0,
+        active: false,
+      });
+    }
+
+    for (let i = 0; i < OBSTACLE_POOL_SIZE; i++) {
+      this.racerObstaclePool.push({
+        lane: 0,
+        z: 0,
+        isOrb: false,
+        active: false,
+      });
+    }
   }
 
   init(): void {
-    this.boltGeo.rotateX(Math.PI / 2);
     this.add(this.gameGroup);
 
     if (this.env.screenMesh) {
@@ -145,9 +217,37 @@ export class VRGameTheater extends xb.Script {
     return this.gameGroup;
   }
 
-  public setQualityProfile(screenRedrawHz: number, maxBlasterTargets: number): void {
+  public setQualityProfile(
+    screenRedrawHz: number,
+    maxBlasterTargets: number,
+    screenResolutionScale = 0.75
+  ): void {
     this.screenRedrawHz = Math.max(8, screenRedrawHz);
-    this.maxBlasterTargets = Math.max(4, maxBlasterTargets);
+    this.maxBlasterTargets = Math.max(4, Math.min(TARGET_POOL_SIZE, maxBlasterTargets));
+
+    const clampedScale = THREE.MathUtils.clamp(screenResolutionScale, 0.5, 1.0);
+    if (Math.abs(clampedScale - this.canvasScale) > 0.05) {
+      this.canvasScale = clampedScale;
+      const nextW = Math.round(LOGICAL_W * clampedScale);
+      const nextH = Math.round(LOGICAL_H * clampedScale);
+      this.canvas.width = nextW;
+      this.canvas.height = nextH;
+      this.gradientCache.clear();
+      // Re-create texture when backing store dimensions change
+      const nextTex = new THREE.CanvasTexture(this.canvas);
+      nextTex.colorSpace = THREE.SRGBColorSpace;
+      nextTex.generateMipmaps = false;
+      nextTex.minFilter = THREE.LinearFilter;
+      nextTex.magFilter = THREE.LinearFilter;
+      const prevTex = this.screenTexture;
+      this.screenTexture = nextTex;
+      if (this.env.screenMesh) {
+        this.env.screenMesh.material.map = nextTex;
+        this.env.screenMesh.material.needsUpdate = true;
+      }
+      prevTex.dispose();
+      this.drawScreen();
+    }
   }
 
   launchApp(app: PlayStoreAppItem): void {
@@ -166,7 +266,9 @@ export class VRGameTheater extends xb.Script {
       this.env.setTheaterDim(0.55);
       this.racerX = 0;
       this.racerSpeed = 0.65;
-      this.racerObstacles = [];
+      for (let i = 0; i < this.racerObstaclePool.length; i++) {
+        this.racerObstaclePool[i].active = false;
+      }
     } else if (this.mode === 'google-workspace') {
       this.env.setTheaterDim(0.6);
       void this.refreshWorkspaceApp();
@@ -334,43 +436,46 @@ export class VRGameTheater extends xb.Script {
   }
 
   private stopCurrentGame(): void {
-    for (const t of this.targets) {
-      t.mesh.removeFromParent();
+    for (let i = 0; i < this.targetPool.length; i++) {
+      this.targetPool[i].active = false;
+      this.targetPool[i].lod.visible = false;
     }
-    this.targets.length = 0;
-    for (const b of this.bolts) {
-      b.mesh.removeFromParent();
+    this.activeTargetCount = 0;
+
+    for (let i = 0; i < this.boltPool.length; i++) {
+      this.boltPool[i].active = false;
+      this.boltPool[i].mesh.visible = false;
     }
-    this.bolts.length = 0;
-    this.racerObstacles.length = 0;
+
+    for (let i = 0; i < this.racerObstaclePool.length; i++) {
+      this.racerObstaclePool[i].active = false;
+    }
   }
 
   private spawnWaveTargets(count: number): void {
-    for (let i = 0; i < count; i++) {
-      const group = new THREE.Group();
-      group.xb = {pointerEvents: 'none'};
-      const core = new THREE.Mesh(this.targetGeo, this.targetMat);
-      const ring = new THREE.Mesh(this.targetRingGeo, this.targetRingMat);
-      ring.rotation.x = Math.PI / 3;
-      group.add(core, ring);
+    let spawned = 0;
+    for (let i = 0; i < this.targetPool.length && spawned < count; i++) {
+      const slot = this.targetPool[i];
+      if (slot.active) continue;
 
       const angle = (Math.random() - 0.5) * Math.PI * 1.65;
       const elevation = 1.2 + Math.random() * 1.45;
       const distance = 2.6 + Math.random() * 2.2;
-      group.position.set(
+
+      slot.angle = angle;
+      slot.elevation = elevation;
+      slot.distance = distance;
+      slot.speed = (0.28 + Math.random() * 0.35) * (Math.random() > 0.5 ? 1 : -1);
+      slot.hp = 1;
+      slot.active = true;
+      slot.lod.position.set(
         Math.sin(angle) * distance,
         elevation,
         -Math.cos(angle) * distance
       );
-      this.gameGroup.add(group);
-      this.targets.push({
-        mesh: group,
-        angle,
-        elevation,
-        distance,
-        speed: (0.28 + Math.random() * 0.35) * (Math.random() > 0.5 ? 1 : -1),
-        hp: 1,
-      });
+      slot.lod.visible = true;
+      spawned += 1;
+      this.activeTargetCount += 1;
     }
   }
 
@@ -399,11 +504,13 @@ export class VRGameTheater extends xb.Script {
 
   public checkAirTouchHit(worldPoint: THREE.Vector3, radius = 0.35): boolean {
     if (this.mode !== 'cosmic-blaster') return false;
-    for (let j = this.targets.length - 1; j >= 0; j--) {
-      const target = this.targets[j];
-      if (worldPoint.distanceTo(target.mesh.position) <= radius) {
-        target.mesh.removeFromParent();
-        this.targets.splice(j, 1);
+    for (let j = 0; j < this.targetPool.length; j++) {
+      const target = this.targetPool[j];
+      if (!target.active) continue;
+      if (worldPoint.distanceTo(target.lod.position) <= radius) {
+        target.active = false;
+        target.lod.visible = false;
+        this.activeTargetCount = Math.max(0, this.activeTargetCount - 1);
         this.score += 120;
         if (this.score > this.highScore) this.highScore = this.score;
         this.sound.playExplosion();
@@ -429,18 +536,26 @@ export class VRGameTheater extends xb.Script {
   }
 
   private spawnBolt(origin: THREE.Vector3, dir: THREE.Vector3): void {
-    const boltMesh = new THREE.Mesh(this.boltGeo, this.boltMat);
-    boltMesh.xb = {pointerEvents: 'none'};
-    boltMesh.position.copy(origin).addScaledVector(dir, 0.25);
-    this._quat.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
-    boltMesh.quaternion.copy(this._quat);
+    // Acquire pre-allocated bolt from fixed pool (zero runtime heap allocations)
+    let bolt: LaserBolt | null = null;
+    for (let i = 0; i < this.boltPool.length; i++) {
+      if (!this.boltPool[i].active) {
+        bolt = this.boltPool[i];
+        break;
+      }
+    }
+    if (!bolt) {
+      // Recycle oldest slot
+      bolt = this.boltPool[0];
+    }
 
-    this.gameGroup.add(boltMesh);
-    this.bolts.push({
-      mesh: boltMesh,
-      velocity: dir.clone().multiplyScalar(15),
-      life: 1.4,
-    });
+    bolt.active = true;
+    bolt.life = 1.4;
+    bolt.velocity.copy(dir).multiplyScalar(15);
+    bolt.mesh.position.copy(origin).addScaledVector(dir, 0.25);
+    this._quat.setFromUnitVectors(BOLT_Z_AXIS, dir);
+    bolt.mesh.quaternion.copy(this._quat);
+    bolt.mesh.visible = true;
     this.sound.playLaser();
   }
 
@@ -469,29 +584,38 @@ export class VRGameTheater extends xb.Script {
   }
 
   private updateCosmicBlaster(dt: number): void {
-    for (const target of this.targets) {
+    const cam = xb.core.camera;
+
+    for (let i = 0; i < this.targetPool.length; i++) {
+      const target = this.targetPool[i];
+      if (!target.active) continue;
       target.angle += target.speed * dt;
       const bob = Math.sin(this.elapsed * 2.4 + target.angle) * 0.14;
-      target.mesh.position.set(
+      target.lod.position.set(
         Math.sin(target.angle) * target.distance,
         target.elevation + bob,
         -Math.cos(target.angle) * target.distance
       );
-      target.mesh.rotation.y += dt * 1.8;
-      target.mesh.rotation.x += dt * 0.9;
+      target.lod.rotation.y += dt * 1.8;
+      target.lod.rotation.x += dt * 0.9;
+      if (cam) target.lod.update(cam);
     }
 
-    for (let i = this.bolts.length - 1; i >= 0; i--) {
-      const bolt = this.bolts[i];
+    for (let i = 0; i < this.boltPool.length; i++) {
+      const bolt = this.boltPool[i];
+      if (!bolt.active) continue;
+
       bolt.mesh.position.addScaledVector(bolt.velocity, dt);
       bolt.life -= dt;
 
       let hit = false;
-      for (let j = this.targets.length - 1; j >= 0; j--) {
-        const target = this.targets[j];
-        if (bolt.mesh.position.distanceTo(target.mesh.position) < 0.34) {
-          target.mesh.removeFromParent();
-          this.targets.splice(j, 1);
+      for (let j = 0; j < this.targetPool.length; j++) {
+        const target = this.targetPool[j];
+        if (!target.active) continue;
+        if (bolt.mesh.position.distanceTo(target.lod.position) < 0.34) {
+          target.active = false;
+          target.lod.visible = false;
+          this.activeTargetCount = Math.max(0, this.activeTargetCount - 1);
           this.score += 100;
           if (this.score > this.highScore) this.highScore = this.score;
           this.sound.playExplosion();
@@ -502,12 +626,12 @@ export class VRGameTheater extends xb.Script {
       }
 
       if (hit || bolt.life <= 0) {
-        bolt.mesh.removeFromParent();
-        this.bolts.splice(i, 1);
+        bolt.active = false;
+        bolt.mesh.visible = false;
       }
     }
 
-    if (this.targets.length === 0) {
+    if (this.activeTargetCount === 0) {
       this.spawnTimer += dt;
       if (this.spawnTimer > 0.8) {
         this.spawnTimer = 0;
@@ -529,13 +653,21 @@ export class VRGameTheater extends xb.Script {
     this.racerSpawnTimer += dt;
     if (this.racerSpawnTimer >= 0.65 / this.racerSpeed) {
       this.racerSpawnTimer = 0;
-      const lane = (Math.floor(Math.random() * 3) - 1) * 0.62;
-      const isOrb = Math.random() > 0.42;
-      this.racerObstacles.push({lane, z: 0.02, isOrb});
+      for (let i = 0; i < this.racerObstaclePool.length; i++) {
+        const slot = this.racerObstaclePool[i];
+        if (!slot.active) {
+          slot.lane = (Math.floor(Math.random() * 3) - 1) * 0.62;
+          slot.z = 0.02;
+          slot.isOrb = Math.random() > 0.42;
+          slot.active = true;
+          break;
+        }
+      }
     }
 
-    for (let i = this.racerObstacles.length - 1; i >= 0; i--) {
-      const obs = this.racerObstacles[i];
+    for (let i = 0; i < this.racerObstaclePool.length; i++) {
+      const obs = this.racerObstaclePool[i];
+      if (!obs.active) continue;
       obs.z += dt * this.racerSpeed;
       if (obs.z >= 0.88 && obs.z <= 0.98) {
         if (Math.abs(obs.lane - this.racerX) < 0.28) {
@@ -549,23 +681,45 @@ export class VRGameTheater extends xb.Script {
           }
           if (this.score > this.highScore) this.highScore = this.score;
           this.onSessionChange?.(this.activeApp, this.score);
-          this.racerObstacles.splice(i, 1);
+          obs.active = false;
           continue;
         }
       }
       if (obs.z > 1.05) {
         this.score += 10;
         if (this.score > this.highScore) this.highScore = this.score;
-        this.racerObstacles.splice(i, 1);
+        obs.active = false;
       }
     }
+  }
+
+  private getCachedGradient(
+    ctx: CanvasRenderingContext2D,
+    key: string,
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    stops: Array<[number, string]>
+  ): CanvasGradient {
+    const existing = this.gradientCache.get(key);
+    if (existing) return existing;
+    const g = ctx.createLinearGradient(x0, y0, x1, y1);
+    for (let i = 0; i < stops.length; i++) {
+      g.addColorStop(stops[i][0], stops[i][1]);
+    }
+    this.gradientCache.set(key, g);
+    return g;
   }
 
   private drawScreen(): void {
     const ctx = this.ctx;
     if (!ctx) return;
-    const W = this.canvas.width;
-    const H = this.canvas.height;
+
+    // Draw using logical 1024x512 coordinates scaled cleanly to the active Eco/Balanced/High canvas
+    ctx.setTransform(this.canvasScale, 0, 0, this.canvasScale, 0, 0);
+    const W = LOGICAL_W;
+    const H = LOGICAL_H;
 
     if (this.mode === 'hub') {
       this.drawHubScreen(ctx, W, H);
@@ -589,11 +743,11 @@ export class VRGameTheater extends xb.Script {
   }
 
   private drawHubScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, '#070d1f');
-    grad.addColorStop(0.5, '#0f172a');
-    grad.addColorStop(1, '#1e1b4b');
-    ctx.fillStyle = grad;
+    ctx.fillStyle = this.getCachedGradient(ctx, 'hub', 0, 0, W, H, [
+      [0, '#070d1f'],
+      [0.5, '#0f172a'],
+      [1, '#1e1b4b'],
+    ]);
     ctx.fillRect(0, 0, W, H);
 
     ctx.strokeStyle = 'rgba(56, 189, 248, 0.1)';
@@ -978,7 +1132,9 @@ export class VRGameTheater extends xb.Script {
     ctx.closePath();
     ctx.fill();
 
-    for (const target of this.targets) {
+    for (let i = 0; i < this.targetPool.length; i++) {
+      const target = this.targetPool[i];
+      if (!target.active) continue;
       const normDist = Math.min(1, target.distance / 5);
       const bx = cx + Math.sin(target.angle) * r * normDist;
       const by = cy - Math.cos(target.angle) * r * normDist;
@@ -998,7 +1154,7 @@ export class VRGameTheater extends xb.Script {
     ctx.fillText(`SCORE ${this.score}`, 48, 120);
     ctx.fillStyle = '#94a3b8';
     ctx.font = '24px sans-serif';
-    ctx.fillText(`WAVE ${this.wave}  •  DRONES LEFT: ${this.targets.length}`, 48, 160);
+    ctx.fillText(`WAVE ${this.wave}  •  DRONES LEFT: ${this.activeTargetCount}`, 48, 160);
 
     ctx.textAlign = 'right';
     ctx.fillStyle = '#34d399';
@@ -1016,10 +1172,10 @@ export class VRGameTheater extends xb.Script {
   }
 
   private drawRacerScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-    const sky = ctx.createLinearGradient(0, 0, 0, H * 0.52);
-    sky.addColorStop(0, '#09051a');
-    sky.addColorStop(1, '#3b0764');
-    ctx.fillStyle = sky;
+    ctx.fillStyle = this.getCachedGradient(ctx, 'racer-sky', 0, 0, 0, H * 0.52, [
+      [0, '#09051a'],
+      [1, '#3b0764'],
+    ]);
     ctx.fillRect(0, 0, W, H * 0.52);
 
     ctx.fillStyle = '#fb7185';
@@ -1063,7 +1219,9 @@ export class VRGameTheater extends xb.Script {
       ctx.stroke();
     }
 
-    for (const obs of this.racerObstacles) {
+    for (let i = 0; i < this.racerObstaclePool.length; i++) {
+      const obs = this.racerObstaclePool[i];
+      if (!obs.active) continue;
       const p = obs.z ** 2;
       const y = horizonY + p * (H - horizonY);
       const roadHalf = THREE.MathUtils.lerp(topW / 2, bottomW / 2, p);
@@ -1159,12 +1317,14 @@ export class VRGameTheater extends xb.Script {
       this.unsubAuth = null;
     }
     this.stopCurrentGame();
+    this.gradientCache.clear();
     this.screenTexture.dispose();
     this.targetGeo.dispose();
     this.targetRingGeo.dispose();
     this.boltGeo.dispose();
     this.boltMat.dispose();
     this.targetMat.dispose();
+    this.targetLowMat.dispose();
     this.targetRingMat.dispose();
   }
 }

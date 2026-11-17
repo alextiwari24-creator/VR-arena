@@ -1,1 +1,0 @@
-import"./three.core-By8EEvyZ.js";export{_t as MeshBasicNodeMaterial,pr as WebGPURenderer}from"./three.webgpu-CpDDBYa7.js";

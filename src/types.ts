@@ -161,8 +161,17 @@ export interface VREngineTelemetry {
   effectiveTier: VREffectiveTier;
   fps: number;
   frameTimeMs: number;
+  p95FrameMs: number;
   pixelRatio: number;
   drawCalls: number;
   triangles: number;
   ipdMm: number;
+  gpuCompression: string;
+  texturesCount: number;
+  geometriesCount: number;
+  estimatedVramMb: number;
+  jsHeapMb: number | null;
+  lodCounts: {high: number; mid: number; low: number};
+  isLowEndHardware: boolean;
+  benchmarkSummary: string;
 }

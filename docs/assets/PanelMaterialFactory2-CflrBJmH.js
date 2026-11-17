@@ -1,0 +1,1 @@
+export{o as setWebGPUUIMaterialLoader}from"./PanelMaterialFactory-CwcvrC8p.js";
