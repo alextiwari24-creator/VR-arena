@@ -10,16 +10,19 @@ export class VRLauncherCard extends xb.UICard {
   private readonly store: VirtualPlayStore;
   private readonly sound: SoundEngine;
   private readonly onLaunchInVR: (app: PlayStoreAppItem) => void;
+  private readonly onInspectApp?: (app: PlayStoreAppItem) => void;
 
   private manageMode = false;
   private filter: LauncherFilter = 'all';
   private selectedApp: PlayStoreAppItem | null = null;
+  private activeRunningId: string | null = null;
   private unsubStore: (() => void) | null = null;
 
   private summaryText: xb.UIText;
   private statusText: xb.UIText;
   private manageBtn: xb.UIButton;
   private restoreBtn: xb.UIButton;
+  private inspectSelectedBtn: xb.UIButton;
   private launchSelectedBtn: xb.UIButton;
   private uninstallSelectedBtn: xb.UIButton;
   private pageUpBtn: xb.UIButton;
@@ -30,24 +33,33 @@ export class VRLauncherCard extends xb.UICard {
   constructor(
     store: VirtualPlayStore,
     sound: SoundEngine,
-    onLaunchInVR: (app: PlayStoreAppItem) => void
+    onLaunchInVR: (app: PlayStoreAppItem) => void,
+    onInspectApp?: (app: PlayStoreAppItem) => void
   ) {
     const summaryText = new xb.UIText({
       text: '0 VR Apps Installed',
-      style: {fontSize: 12, color: '#93c5fd'},
+      style: {fontSize: 12.5, color: '#93c5fd'},
     });
 
     const manageBtn = new xb.UIButton({
       label: 'Manage Apps',
       icon: 'tune',
-      style: {height: 32, fontSize: 12},
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+      },
     });
 
     const restoreBtn = new xb.UIButton({
       label: 'Restore',
       icon: 'restore',
       visible: false,
-      style: {height: 32, fontSize: 12},
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(52, 211, 153, 0.28)'},
+      },
     });
 
     const filters: Array<{id: LauncherFilter; label: string}> = [
@@ -61,7 +73,12 @@ export class VRLauncherCard extends xb.UICard {
     for (const f of filters) {
       const btn = new xb.UIButton({
         label: f.label,
-        style: {flexGrow: 1, height: 30, fontSize: 11.5},
+        style: {
+          flexGrow: 1,
+          height: 34,
+          fontSize: 12,
+          ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+        },
       });
       filterBtns.set(f.id, btn);
       filterChildren.push(btn);
@@ -73,43 +90,70 @@ export class VRLauncherCard extends xb.UICard {
         width: '100%',
         flexGrow: 1,
         flexBasis: 0,
-        minHeight: 240,
+        minHeight: 235,
         gap: 10,
       },
     });
 
     const statusText = new xb.UIText({
-      text: 'Select any app icon with Gaze or Controller to launch directly in VR.',
+      text: 'Gaze 1s / Space / Tap any icon to Launch directly into VR.',
       style: {fontSize: 11.5, color: '#34d399', flexGrow: 1, flexShrink: 1},
+    });
+
+    const inspectSelectedBtn = new xb.UIButton({
+      label: 'Info',
+      icon: 'info',
+      disabled: true,
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+      },
     });
 
     const launchSelectedBtn = new xb.UIButton({
       label: 'Launch VR',
       icon: 'vrpano',
       disabled: true,
-      style: {height: 32, fontSize: 12},
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(52, 211, 153, 0.35)'},
+      },
     });
 
     const uninstallSelectedBtn = new xb.UIButton({
       label: 'Uninstall',
       icon: 'delete',
       disabled: true,
-      style: {height: 32, fontSize: 12},
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(244, 63, 94, 0.38)'},
+      },
     });
 
     const pageUpBtn = new xb.UIButton({
       icon: 'keyboard_arrow_up',
       ariaLabel: 'Scroll launcher up',
-      style: {width: 38, height: 32},
+      style: {
+        width: 42,
+        height: 36,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+      },
     });
     const pageDownBtn = new xb.UIButton({
       icon: 'keyboard_arrow_down',
       ariaLabel: 'Scroll launcher down',
-      style: {width: 38, height: 32},
+      style: {
+        width: 42,
+        height: 36,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+      },
     });
 
     super({
-      size: {width: 0.84, height: 0.74},
+      size: {width: 0.88, height: 0.76},
       manipulation: true,
       edge: true,
       style: {flexDirection: 'column', gap: 9, padding: 16},
@@ -163,7 +207,14 @@ export class VRLauncherCard extends xb.UICard {
             backgroundColor: 'rgba(15, 23, 42, 0.78)',
             borderRadius: 12,
           },
-          children: [statusText, launchSelectedBtn, uninstallSelectedBtn, pageUpBtn, pageDownBtn],
+          children: [
+            statusText,
+            inspectSelectedBtn,
+            launchSelectedBtn,
+            uninstallSelectedBtn,
+            pageUpBtn,
+            pageDownBtn,
+          ],
         }),
       ],
     });
@@ -172,10 +223,12 @@ export class VRLauncherCard extends xb.UICard {
     this.store = store;
     this.sound = sound;
     this.onLaunchInVR = onLaunchInVR;
+    this.onInspectApp = onInspectApp;
     this.summaryText = summaryText;
     this.statusText = statusText;
     this.manageBtn = manageBtn;
     this.restoreBtn = restoreBtn;
+    this.inspectSelectedBtn = inspectSelectedBtn;
     this.launchSelectedBtn = launchSelectedBtn;
     this.uninstallSelectedBtn = uninstallSelectedBtn;
     this.pageUpBtn = pageUpBtn;
@@ -191,6 +244,16 @@ export class VRLauncherCard extends xb.UICard {
     this.rebuildGrid();
   }
 
+  public getScrollView(): xb.UIScrollView {
+    return this.gridScroll;
+  }
+
+  public setActiveRunningApp(appId: string | null): void {
+    if (this.activeRunningId === appId) return;
+    this.activeRunningId = appId;
+    this.rebuildGrid();
+  }
+
   private wireControls(): void {
     this.manageBtn.onClick = () => {
       this.sound.playClick();
@@ -202,7 +265,7 @@ export class VRLauncherCard extends xb.UICard {
         : 'rgba(255, 255, 255, 0.08)';
       this.restoreBtn.visible = this.manageMode;
       this.statusText.text = this.manageMode
-        ? 'Manage Mode: Gaze/click an app icon to Uninstall or Launch in VR.'
+        ? 'Manage Mode: Gaze/click an app to Inspect, Launch, or Uninstall.'
         : 'Launch Mode: Gaze/click any icon to launch directly into VR mode.';
       this.rebuildGrid();
     };
@@ -211,6 +274,12 @@ export class VRLauncherCard extends xb.UICard {
       this.sound.playInstallComplete();
       this.store.restoreDefaultApps();
       this.statusText.text = 'Restored default Google & VR apps.';
+    };
+
+    this.inspectSelectedBtn.onClick = () => {
+      if (!this.selectedApp) return;
+      this.sound.playClick();
+      this.onInspectApp?.(this.selectedApp);
     };
 
     this.launchSelectedBtn.onClick = () => {
@@ -273,6 +342,7 @@ export class VRLauncherCard extends xb.UICard {
 
   private syncSelectionBar(): void {
     const app = this.selectedApp;
+    this.inspectSelectedBtn.disabled = !app;
     this.launchSelectedBtn.disabled = !app;
     this.uninstallSelectedBtn.disabled = !app;
     if (app) {
@@ -345,6 +415,7 @@ export class VRLauncherCard extends xb.UICard {
     }
 
     const isSelected = this.selectedApp?.id === app.id;
+    const isRunning = this.activeRunningId === app.id;
     const shortTitle =
       app.title.length > 15 ? `${app.title.slice(0, 14).trim()}…` : app.title;
 
@@ -358,25 +429,36 @@ export class VRLauncherCard extends xb.UICard {
         alignItems: 'center',
         justifyContent: 'center',
         gap: 6,
-        padding: 10,
+        padding: 11,
         borderRadius: 14,
-        backgroundColor: isSelected
-          ? 'rgba(56, 189, 248, 0.32)'
-          : 'rgba(15, 23, 42, 0.76)',
-        borderColor: isSelected ? '#38bdf8' : 'rgba(255, 255, 255, 0.08)',
-        borderWidth: isSelected ? 2 : 1,
+        backgroundColor: isRunning
+          ? 'rgba(52, 211, 153, 0.25)'
+          : isSelected
+            ? 'rgba(56, 189, 248, 0.32)'
+            : 'rgba(15, 23, 42, 0.78)',
+        borderColor: isRunning
+          ? '#34d399'
+          : isSelected
+            ? '#38bdf8'
+            : 'rgba(255, 255, 255, 0.1)',
+        borderWidth: isRunning || isSelected ? 2 : 1,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.26)'},
       },
       children: [
         icon,
         new xb.UIText({
           text: shortTitle,
           pointerEvents: 'none',
-          style: {fontSize: 12.5, fontWeight: 'bold', textAlign: 'center'},
+          style: {fontSize: 13, fontWeight: 'bold', textAlign: 'center'},
         }),
         new xb.UIText({
-          text: `${app.badge} • ${app.sizeMb}MB`,
+          text: isRunning ? 'ACTIVE IN VR' : `${app.badge} • ${app.sizeMb}MB`,
           pointerEvents: 'none',
-          style: {fontSize: 10, color: '#94a3b8', textAlign: 'center'},
+          style: {
+            fontSize: 10.5,
+            color: isRunning ? '#34d399' : '#94a3b8',
+            textAlign: 'center',
+          },
         }),
       ],
       onClick: () => {
@@ -385,6 +467,7 @@ export class VRLauncherCard extends xb.UICard {
         this.syncSelectionBar();
         if (this.manageMode) {
           this.rebuildGrid();
+          this.onInspectApp?.(app);
         } else {
           this.statusText.text = `Launching ${app.title} directly in VR Mode...`;
           this.onLaunchInVR(app);
@@ -393,16 +476,38 @@ export class VRLauncherCard extends xb.UICard {
     });
 
     if (!this.manageMode) {
+      const quickInfoBtn = new xb.UIButton({
+        label: 'Info',
+        icon: 'info',
+        ariaLabel: `Inspect ${app.title} details`,
+        style: {
+          width: '100%',
+          height: 28,
+          fontSize: 11,
+          ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.28)'},
+        },
+        onClick: () => {
+          this.sound.playClick();
+          this.selectedApp = app;
+          this.syncSelectionBar();
+          this.onInspectApp?.(app);
+        },
+      });
       return new xb.UIPanel({
-        style: {flexGrow: 1, flexBasis: 0, flexDirection: 'column'},
-        children: [tileBtn],
+        style: {flexGrow: 1, flexBasis: 0, flexDirection: 'column', gap: 4},
+        children: [tileBtn, quickInfoBtn],
       });
     }
 
     const uninstallTileBtn = new xb.UIButton({
       label: 'Uninstall',
       icon: 'delete_outline',
-      style: {width: '100%', height: 28, fontSize: 11},
+      style: {
+        width: '100%',
+        height: 30,
+        fontSize: 11.5,
+        ':hover': {backgroundColor: 'rgba(244, 63, 94, 0.36)'},
+      },
       onClick: () => {
         this.sound.playClick();
         this.store.uninstallApp(app.id);

@@ -16,7 +16,9 @@ import {
 import {VirtualPlayStore} from './store/VirtualPlayStore.ts';
 import {PlayStoreAppItem} from './types.ts';
 import {mountGoogleSignInOverlay} from './ui/googleSignInOverlay.ts';
+import {AppInfoCard} from './ui/AppInfoCard.ts';
 import {SensorCalibrationCard} from './ui/SensorCalibrationCard.ts';
+import {SpatialCommandDock, SpatialWorkspaceTab} from './ui/SpatialCommandDock.ts';
 import {VirtualPlayBrowserCard} from './ui/VirtualPlayBrowserCard.ts';
 import {VRLauncherCard} from './ui/VRLauncherCard.ts';
 
@@ -33,6 +35,8 @@ export class VRStoreHubApp extends xb.Script {
   private storeCard!: VirtualPlayStore;
   private launcherCard!: VRLauncherCard;
   private browserCard!: VirtualPlayBrowserCard;
+  private appInfoCard!: AppInfoCard;
+  private spatialDock!: SpatialCommandDock;
   private unsubscribeQuality: (() => void) | null = null;
 
   private hudOverlay!: xb.UIOverlay;
@@ -40,6 +44,8 @@ export class VRStoreHubApp extends xb.Script {
   private hudGestureText!: xb.UIText;
   private launcherHudBtn!: xb.UIButton;
   private browserHudBtn!: xb.UIButton;
+  private vrSelectHudBtn!: xb.UIButton;
+  private camHeadHudBtn!: xb.UIButton;
   private camHandsHudBtn!: xb.UIButton;
   private arViewHudBtn!: xb.UIButton;
   private stereoHudBtn!: xb.UIButton;
@@ -53,6 +59,8 @@ export class VRStoreHubApp extends xb.Script {
   private panelsVisible = true;
   private launcherVisible = true;
   private browserVisible = true;
+  private activeWorkspace: SpatialWorkspaceTab = 'all';
+  private activeSessionAppName: string | null = null;
   private screenScale = 1.0;
   private userPrefersAR = false;
   private unmountGoogleOverlay: (() => void) | null = null;
@@ -115,6 +123,8 @@ export class VRStoreHubApp extends xb.Script {
       onFireFromGaze: (origin, dir) => this.theater.fireAlongRay(origin, dir),
       onBoost: () => this.theater.triggerRacerBoost(),
       onExitToHub: () => this.theater.exitToHub(),
+      onBack: () => this.appInfoCard?.close() ?? false,
+      onToggleStereo: () => this.toggleStereoView(),
       onJump: () => this.theater.triggerLocomotionJump(),
       onStep: (running) => this.theater.triggerLocomotionStep(running),
       onStatusUpdate: (label) => {
@@ -131,7 +141,7 @@ export class VRStoreHubApp extends xb.Script {
       this.headGaze,
       this.vrEngine
     );
-    this.sensorCard.position.set(-0.98, 1.34, -0.96);
+    this.sensorCard.position.set(-0.96, 1.36, -0.94);
     this.sensorCard.rotation.y = 0.56;
     this.add(this.sensorCard);
 
@@ -139,9 +149,10 @@ export class VRStoreHubApp extends xb.Script {
     this.storeCard = new VirtualPlayStore(
       this.theater,
       this.sound,
-      (app) => this.launchAppDirectlyIntoVR(app)
+      (app) => this.launchAppDirectlyIntoVR(app),
+      (app) => this.inspectAppInSpatialView(app)
     );
-    this.storeCard.position.set(0.98, 1.34, -0.96);
+    this.storeCard.position.set(0.96, 1.36, -0.94);
     this.storeCard.rotation.y = -0.56;
     this.add(this.storeCard);
 
@@ -149,24 +160,47 @@ export class VRStoreHubApp extends xb.Script {
     this.launcherCard = new VRLauncherCard(
       this.storeCard,
       this.sound,
-      (app) => this.launchAppDirectlyIntoVR(app)
+      (app) => this.launchAppDirectlyIntoVR(app),
+      (app) => this.inspectAppInSpatialView(app)
     );
-    this.launcherCard.position.set(0, 1.3, -1.2);
+    this.launcherCard.position.set(0, 1.38, -1.24);
     this.launcherCard.rotation.x = -0.04;
     this.add(this.launcherCard);
 
     // Right Wing Card: Live Google Play Store Web Browser inside VR
     this.browserCard = new VirtualPlayBrowserCard(this.storeCard, this.theater, this.sound);
-    this.browserCard.position.set(1.58, 1.3, -0.16);
-    this.browserCard.rotation.y = -1.28;
+    this.browserCard.position.set(1.38, 1.36, -0.32);
+    this.browserCard.rotation.y = -1.04;
     this.add(this.browserCard);
+
+    // Spatial App Details & Installation Inspector Card (animated with VisibilityTransition)
+    this.appInfoCard = new AppInfoCard(this.storeCard, this.sound, (app) =>
+      this.launchAppDirectlyIntoVR(app)
+    );
+    this.appInfoCard.position.set(0, 1.24, -1.02);
+    this.appInfoCard.rotation.x = -0.06;
+    this.add(this.appInfoCard);
+
+    // Horizon-Stabilized Spatial Command Dock (works in Mono, Cardboard SBS & WebXR)
+    this.spatialDock = new SpatialCommandDock(this.sound, {
+      onSelectWorkspace: (tab) => this.applyWorkspaceFocus(tab),
+      onToggleStereo: () => this.toggleStereoView(),
+      onRecenter: () => this.sensors.recenter(),
+      onExitApp: () => this.theater.exitToHub(),
+      onTriggerGazeSelect: () => {
+        this.headGaze.triggerCurrentTarget('Spatial Dock');
+      },
+    });
+    this.add(this.spatialDock);
 
     // Bottom View-Space Session HUD Overlay
     this.hudOverlay = this.createHudOverlay();
     this.add(this.hudOverlay);
 
-    // Register UI cards, Launcher, Storefront, Browser, HUD, Theater Screen, and 3D toys
+    // Register UI cards, Launcher, Storefront, Browser, Inspector, Spatial Dock, HUD, Theater Screen, and 3D toys
     const roots = [
+      this.spatialDock,
+      this.appInfoCard,
       this.launcherCard,
       this.sensorCard,
       this.storeCard,
@@ -178,6 +212,7 @@ export class VRStoreHubApp extends xb.Script {
     this.headGaze.registerInteractiveRoots(roots);
     this.headGaze.registerPlayground(this.playground);
     this.headGaze.registerDroneContainer(this.theater.getGameGroup());
+    this.headGaze.setFallbackScrollView(this.launcherCard.getScrollView());
     if (this.env.screenMesh) {
       this.gestures.registerTheaterScreen(this.env.screenMesh);
       this.headGaze.registerTheaterScreen(this.env.screenMesh);
@@ -186,16 +221,116 @@ export class VRStoreHubApp extends xb.Script {
     this.unmountGoogleOverlay = mountGoogleSignInOverlay();
   }
 
+  private toggleStereoView(): void {
+    const next = !this.vrEngine.isStereoEnabled();
+    this.vrEngine.setStereoEnabled(next);
+    this.sensors.setCardboardStereo(next);
+    this.stereoHudBtn.label = next ? 'VR SBS: ON' : 'VR SBS: OFF';
+    this.spatialDock.setStereoState(next);
+  }
+
+  private inspectAppInSpatialView(app: PlayStoreAppItem): void {
+    this.appInfoCard.showApp(app);
+  }
+
+  private applyWorkspaceFocus(tab: SpatialWorkspaceTab): void {
+    this.activeWorkspace = tab;
+    this.spatialDock.setActiveTab(tab);
+    this.panelsVisible = true;
+    this.togglePanelsBtn.label = 'Hide Panels';
+    this.togglePanelsBtn.icon = 'visibility_off';
+
+    if (tab === 'all') {
+      this.launcherVisible = true;
+      this.browserVisible = true;
+      this.launcherCard.visible = true;
+      this.sensorCard.visible = true;
+      this.storeCard.visible = true;
+      this.browserCard.visible = true;
+      this.launcherCard.position.set(0, 1.38, -1.24);
+      this.launcherCard.rotation.set(-0.04, 0, 0);
+      this.sensorCard.position.set(-0.96, 1.36, -0.94);
+      this.sensorCard.rotation.set(0, 0.56, 0);
+      this.storeCard.position.set(0.96, 1.36, -0.94);
+      this.storeCard.rotation.set(0, -0.56, 0);
+      this.browserCard.position.set(1.38, 1.36, -0.32);
+      this.browserCard.rotation.set(0, -1.04, 0);
+      this.headGaze.setFallbackScrollView(this.launcherCard.getScrollView());
+    } else if (tab === 'launcher') {
+      this.launcherVisible = true;
+      this.browserVisible = false;
+      this.launcherCard.visible = true;
+      this.storeCard.visible = false;
+      this.browserCard.visible = false;
+      this.sensorCard.visible = false;
+      this.launcherCard.position.set(0, 1.38, -1.16);
+      this.launcherCard.rotation.set(-0.04, 0, 0);
+      this.headGaze.setFallbackScrollView(this.launcherCard.getScrollView());
+    } else if (tab === 'store') {
+      this.launcherVisible = true;
+      this.browserVisible = false;
+      this.launcherCard.visible = true;
+      this.storeCard.visible = true;
+      this.browserCard.visible = false;
+      this.sensorCard.visible = false;
+      this.launcherCard.position.set(-0.52, 1.36, -1.16);
+      this.launcherCard.rotation.set(0, 0.24, 0);
+      this.storeCard.position.set(0.52, 1.36, -1.16);
+      this.storeCard.rotation.set(0, -0.24, 0);
+      this.headGaze.setFallbackScrollView(this.storeCard.getScrollView());
+    } else if (tab === 'browser') {
+      this.launcherVisible = true;
+      this.browserVisible = true;
+      this.launcherCard.visible = true;
+      this.storeCard.visible = false;
+      this.browserCard.visible = true;
+      this.sensorCard.visible = false;
+      this.launcherCard.position.set(-0.52, 1.36, -1.16);
+      this.launcherCard.rotation.set(0, 0.24, 0);
+      this.browserCard.position.set(0.52, 1.36, -1.16);
+      this.browserCard.rotation.set(0, -0.24, 0);
+      this.headGaze.setFallbackScrollView(this.browserCard.getScrollView());
+    } else if (tab === 'sensors') {
+      this.launcherVisible = true;
+      this.browserVisible = false;
+      this.launcherCard.visible = true;
+      this.sensorCard.visible = true;
+      this.storeCard.visible = false;
+      this.browserCard.visible = false;
+      this.sensorCard.position.set(-0.48, 1.36, -1.14);
+      this.sensorCard.rotation.set(0, 0.22, 0);
+      this.launcherCard.position.set(0.48, 1.36, -1.14);
+      this.launcherCard.rotation.set(0, -0.22, 0);
+      this.headGaze.setFallbackScrollView(this.launcherCard.getScrollView());
+    }
+
+    this.launcherHudBtn.label = this.launcherCard.visible ? 'Launcher: ON' : 'Launcher: OFF';
+    this.browserHudBtn.label = this.browserCard.visible ? 'Browser: ON' : 'Browser: OFF';
+  }
+
+  /**
+   * Handles simple single-button / Cardboard tap / WebXR controller select on empty space
+   * by triggering whichever spatial menu element is currently under the Head-Gaze reticle.
+   */
+  onSelectEnd(event: xb.SelectEvent): void {
+    if (event.target || !this.headGaze?.isEnabled()) return;
+    if (this.headGaze.triggerCurrentTarget('VR Trigger')) {
+      event.stopPropagation();
+    }
+  }
+
   /**
    * Ensures VR stereoscopic presentation is active before launching any app into VR Mode.
    */
   private launchAppDirectlyIntoVR(app: PlayStoreAppItem): void {
+    this.appInfoCard.close();
     const renderer = xb.core.renderer as THREE.WebGLRenderer | undefined;
     const isXrPresenting = Boolean(renderer?.xr?.isPresenting);
     if (!isXrPresenting && !this.vrEngine.isStereoEnabled()) {
       this.vrEngine.setStereoEnabled(true);
       this.sensors.setCardboardStereo(true);
       this.stereoHudBtn.label = 'VR SBS: ON';
+      this.spatialDock.setStereoState(true);
     }
     this.theater.launchApp(app);
   }
@@ -292,6 +427,16 @@ export class VRStoreHubApp extends xb.Script {
       },
     });
 
+    this.vrSelectHudBtn = new xb.UIButton({
+      label: 'VR Select (Space)',
+      icon: 'touch_app',
+      onClick: () => {
+        if (!this.headGaze.triggerCurrentTarget('Emulated Button')) {
+          this.sound.playClick();
+        }
+      },
+    });
+
     this.launcherHudBtn = new xb.UIButton({
       label: 'Launcher: ON',
       icon: 'apps',
@@ -311,12 +456,11 @@ export class VRStoreHubApp extends xb.Script {
       icon: 'public',
       onClick: () => {
         this.sound.playClick();
-        this.browserVisible = !this.browserVisible;
-        this.browserCard.visible = this.browserVisible && this.panelsVisible;
-        if (this.browserVisible && !this.panelsVisible) {
-          this.setPanelsVisible(true);
+        if (this.activeWorkspace !== 'browser') {
+          this.applyWorkspaceFocus('browser');
+        } else {
+          this.applyWorkspaceFocus('all');
         }
-        this.browserHudBtn.label = this.browserVisible ? 'Browser: ON' : 'Browser: OFF';
       },
     });
 
@@ -329,6 +473,20 @@ export class VRStoreHubApp extends xb.Script {
         } else {
           this.theater.showControlSchemeGuide();
         }
+      },
+    });
+
+    this.camHeadHudBtn = new xb.UIButton({
+      label: 'Back-Cam Head: OFF',
+      icon: 'videocam',
+      onClick: () => {
+        this.sound.playClick();
+        this.camHeadHudBtn.disabled = true;
+        this.camHeadHudBtn.label = 'Starting Cam...';
+        void this.sensors.toggleCameraOpticalFlow().then((active) => {
+          this.camHeadHudBtn.disabled = false;
+          this.camHeadHudBtn.label = active ? 'Back-Cam Head: ON' : 'Back-Cam Head: OFF';
+        });
       },
     });
 
@@ -373,10 +531,7 @@ export class VRStoreHubApp extends xb.Script {
       icon: 'vrpano',
       onClick: () => {
         this.sound.playClick();
-        const next = !this.vrEngine.isStereoEnabled();
-        this.vrEngine.setStereoEnabled(next);
-        this.sensors.setCardboardStereo(next);
-        this.stereoHudBtn.label = next ? 'VR SBS: ON' : 'VR SBS: OFF';
+        this.toggleStereoView();
       },
     });
 
@@ -476,19 +631,32 @@ export class VRStoreHubApp extends xb.Script {
             flexDirection: 'row',
             alignItems: 'center',
             justifyContent: 'center',
-            gap: 5,
+            gap: 6,
           },
           children: [
+            this.vrSelectHudBtn,
             this.launcherHudBtn,
             this.browserHudBtn,
             this.gazeHudBtn,
+            this.stereoHudBtn,
             this.controlsGuideBtn,
+            this.exitGameBtn,
+          ],
+        }),
+        new xb.UIPanel({
+          style: {
+            width: '100%',
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 6,
+          },
+          children: [
+            this.camHeadHudBtn,
             this.camHandsHudBtn,
             this.arViewHudBtn,
-            this.stereoHudBtn,
             this.cinemaPlayBtn,
             this.cinemaDimBtn,
-            this.exitGameBtn,
             recenterBtn,
             scaleBtn,
             this.togglePanelsBtn,
@@ -503,17 +671,24 @@ export class VRStoreHubApp extends xb.Script {
 
   private setPanelsVisible(visible: boolean): void {
     this.panelsVisible = visible;
-    this.launcherCard.visible = visible && this.launcherVisible;
-    this.sensorCard.visible = visible;
-    this.storeCard.visible = visible;
-    this.browserCard.visible = visible && this.browserVisible;
+    if (visible) {
+      this.applyWorkspaceFocus(this.activeWorkspace);
+    } else {
+      this.launcherCard.visible = false;
+      this.sensorCard.visible = false;
+      this.storeCard.visible = false;
+      this.browserCard.visible = false;
+      this.appInfoCard.close();
+    }
     this.togglePanelsBtn.label = visible ? 'Hide Panels' : 'Show Panels';
     this.togglePanelsBtn.icon = visible ? 'visibility_off' : 'visibility';
   }
 
   private handleSessionChange(app: PlayStoreAppItem | null, score: number): void {
     if (!app) {
-      this.hudTitleText.text = 'VR Hub • 16 Google Apps Ready • Gaze 1s / Nod = Click';
+      this.activeSessionAppName = null;
+      this.launcherCard.setActiveRunningApp(null);
+      this.hudTitleText.text = 'VR Hub • Look + Space/Tap/Dwell 1s = Select • Esc/Shake = Back';
       this.exitGameBtn.visible = false;
       this.cinemaPlayBtn.visible = false;
       this.cinemaDimBtn.visible = false;
@@ -521,6 +696,8 @@ export class VRStoreHubApp extends xb.Script {
       return;
     }
 
+    this.activeSessionAppName = app.title;
+    this.launcherCard.setActiveRunningApp(app.id);
     this.exitGameBtn.visible = true;
     const isCinema = app.playableMode === 'cinema-deck';
     this.cinemaPlayBtn.visible = isCinema;
@@ -541,6 +718,14 @@ export class VRStoreHubApp extends xb.Script {
     this.env.setCompassRingRotation(tel.compassHeadingDeg);
 
     const gTel = this.gestures.getTelemetry();
+    if (!this.camHeadHudBtn.disabled) {
+      const targetCamHeadLabel = this.sensors.isCameraFlowEnabled()
+        ? 'Back-Cam Head: ON'
+        : 'Back-Cam Head: OFF';
+      if (this.camHeadHudBtn.label !== targetCamHeadLabel) {
+        this.camHeadHudBtn.label = targetCamHeadLabel;
+      }
+    }
     if (!gTel.cameraHandsLoading) {
       const targetHudLabel = gTel.cameraHandsActive ? 'Back-Cam: ON' : 'Back-Cam: OFF';
       if (this.camHandsHudBtn.label !== targetHudLabel) {
@@ -551,10 +736,12 @@ export class VRStoreHubApp extends xb.Script {
     if (this.arViewHudBtn.label !== targetArLabel) {
       this.arViewHudBtn.label = targetArLabel;
     }
-    const targetStereoLabel = this.vrEngine.isStereoEnabled() ? 'VR SBS: ON' : 'VR SBS: OFF';
+    const stereoOn = this.vrEngine.isStereoEnabled();
+    const targetStereoLabel = stereoOn ? 'VR SBS: ON' : 'VR SBS: OFF';
     if (this.stereoHudBtn.label !== targetStereoLabel) {
       this.stereoHudBtn.label = targetStereoLabel;
     }
+    this.spatialDock.setStereoState(stereoOn);
 
     const gazeTel = this.headGaze.getTelemetry();
     const targetGazeLabel = gazeTel.enabled ? 'Gaze: ON' : 'Gaze: OFF';
@@ -562,10 +749,18 @@ export class VRStoreHubApp extends xb.Script {
       this.gazeHudBtn.label = targetGazeLabel;
     }
 
+    const dwellPct = Math.round(gazeTel.dwellProgress * 100);
+    this.spatialDock.setStatusInfo(
+      gazeTel.enabled ? gazeTel.hoveredLabel : '',
+      dwellPct,
+      this.activeSessionAppName
+    );
+
     if (gazeTel.enabled && gazeTel.hoveredLabel) {
-      const pct = Math.round(gazeTel.dwellProgress * 100);
       this.hudGestureText.text =
-        pct > 5 ? `Gaze ${pct}%: ${gazeTel.hoveredLabel}` : `Gazing: ${gazeTel.hoveredLabel}`;
+        dwellPct > 5
+          ? `Gaze ${dwellPct}%: ${gazeTel.hoveredLabel}`
+          : `Gazing: ${gazeTel.hoveredLabel}`;
     } else if (gTel.activeGesture !== 'none' || gTel.cameraHandsActive) {
       this.hudGestureText.text = gTel.lastActionLabel;
     } else if (gazeTel.enabled) {

@@ -169,12 +169,31 @@ export class SensorFusionTracker extends xb.Script {
   private cameraVideo: HTMLVideoElement | null = null;
   private cameraConsumers = new Set<string>();
   private cameraFlowEnabled = false;
+  private switchedToCameraFlowByToggle = false;
+  private modeBeforeCameraFlow: SensorTrackingMode = 'auto';
   private flowCanvas: HTMLCanvasElement | null = null;
   private flowCtx: CanvasRenderingContext2D | null = null;
-  private prevLuma: Uint8Array | null = null;
   private readonly flowW = 96;
   private readonly flowH = 72;
+  private readonly coarseW = 48;
+  private readonly coarseH = 36;
+  private readonly currLuma = new Uint8Array(96 * 72);
+  private readonly prevLuma = new Uint8Array(96 * 72);
+  private readonly coarseCurr = new Uint8Array(48 * 36);
+  private readonly coarsePrev = new Uint8Array(48 * 36);
+  private readonly patchDx = new Float32Array(9);
+  private readonly patchDy = new Float32Array(9);
+  private readonly sortScratch = new Float32Array(9);
+  private hasPrevLuma = false;
   private flowSampleAccum = 0;
+  private visVertLp = 0;
+  private visVySmooth = 0;
+  private visPeakPos = 0;
+  private visPeakNeg = 0;
+  private visJumpPrimedUntil = 0;
+  private visDivergenceLp = 0;
+  private visForwardHoldFrames = 0;
+  private visCoherentForward = false;
 
   // Screen wake lock
   private wakeLockSentinel: {release: () => Promise<void>} | null = null;
@@ -709,6 +728,8 @@ export class SensorFusionTracker extends xb.Script {
   }
 
   private processLocomotionSample(lx: number, ly: number, lz: number, now: number): void {
+    // In dedicated camera-flow mode, Walk/Run/Jump is sensed purely by the back camera
+    if (this.mode === 'camera-flow' || this.mode === 'off') return;
     const dtMs =
       this.lastMotionStepSampleAt > 0
         ? Math.min(80, Math.max(4, now - this.lastMotionStepSampleAt))
@@ -991,7 +1012,7 @@ export class SensorFusionTracker extends xb.Script {
       canvas.height = this.flowH;
       this.flowCanvas = canvas;
       this.flowCtx = canvas.getContext('2d', {willReadFrequently: true});
-      this.prevLuma = null;
+      this.hasPrevLuma = false;
     }
     this.autoFlowEnabled = true;
   }
@@ -1028,16 +1049,35 @@ export class SensorFusionTracker extends xb.Script {
 
     this.ensureAutoOpticalFlow();
     this.cameraFlowEnabled = true;
+    this.hasPrevLuma = false;
+    this.visVertLp = 0;
+    this.visVySmooth = 0;
+    this.visPeakPos = 0;
+    this.visPeakNeg = 0;
+    this.visDivergenceLp = 0;
+    this.visForwardHoldFrames = 0;
+    this.visCoherentForward = false;
+    this.visJumpPrimedUntil = 0;
+    if (this.mode !== 'camera-flow') {
+      this.modeBeforeCameraFlow = this.mode;
+      this.mode = 'camera-flow';
+      this.switchedToCameraFlowByToggle = true;
+    }
+    this.fusionAlgorithmLabel = 'Back-Cam Optical 6DoF';
     return true;
   }
 
   stopCameraOpticalFlow(): void {
     this.cameraFlowEnabled = false;
+    if (this.switchedToCameraFlowByToggle && this.mode === 'camera-flow') {
+      this.mode = this.modeBeforeCameraFlow;
+    }
+    this.switchedToCameraFlowByToggle = false;
     this.releaseSharedCamera('optical-flow');
     if (this.cameraConsumers.size === 0) {
       this.flowCanvas = null;
       this.flowCtx = null;
-      this.prevLuma = null;
+      this.hasPrevLuma = false;
     }
   }
 
@@ -1045,76 +1085,159 @@ export class SensorFusionTracker extends xb.Script {
     return this.cameraFlowEnabled;
   }
 
-  /**
-   * 3x3 Multi-Patch Median-Consensus Optical Flow with subpixel parabolic refinement.
-   */
-  private sampleCameraOpticalFlow(dt: number): void {
-    if (
-      (!this.cameraFlowEnabled && !this.autoFlowEnabled) ||
-      !this.cameraVideo ||
-      !this.flowCtx ||
-      this.cameraVideo.readyState < 2
-    ) {
-      return;
+  private median9(values: Float32Array): number {
+    for (let i = 0; i < 9; i++) {
+      this.sortScratch[i] = values[i];
     }
+    for (let i = 1; i < 9; i++) {
+      const key = this.sortScratch[i];
+      let j = i - 1;
+      while (j >= 0 && this.sortScratch[j] > key) {
+        this.sortScratch[j + 1] = this.sortScratch[j];
+        j -= 1;
+      }
+      this.sortScratch[j + 1] = key;
+    }
+    return this.sortScratch[4];
+  }
 
-    this.flowSampleAccum += dt;
-    if (this.flowSampleAccum < 1 / 30) return;
-    this.flowSampleAccum = 0;
+  private computeSadBlock(
+    prev: Uint8Array,
+    curr: Uint8Array,
+    stride: number,
+    x0: number,
+    x1: number,
+    y0: number,
+    y1: number,
+    dx: number,
+    dy: number,
+    step: number
+  ): number {
+    let sad = 0;
+    for (let y = y0; y < y1; y += step) {
+      const rowA = y * stride;
+      const rowB = (y + dy) * stride;
+      for (let x = x0; x < x1; x += step) {
+        const diff = prev[rowA + x] - curr[rowB + x + dx];
+        sad += diff < 0 ? -diff : diff;
+      }
+    }
+    return sad;
+  }
 
+  /**
+   * 2-Level Coarse-to-Fine 3x3 Multi-Patch Optical Flow (Zero-GC).
+   * Senses Head Yaw (Turn Left/Right), Pitch (Look Up/Down), Roll (Tilt),
+   * and Body Locomotion (Walk, Run, Jump) directly from the back camera.
+   */
+  public processCameraLumaFrame(
+    curr: Uint8Array,
+    dtSec: number,
+    now = performance.now(),
+    orientationAngleDeg?: number
+  ): void {
     const w = this.flowW;
     const h = this.flowH;
-    this.flowCtx.drawImage(this.cameraVideo, 0, 0, w, h);
-    const frame = this.flowCtx.getImageData(0, 0, w, h).data;
-    const curr = new Uint8Array(w * h);
+    const cw = this.coarseW;
+    const len = w * h;
+
     let lumaSum = 0;
     let lumaSqSum = 0;
-    for (let i = 0, p = 0; i < curr.length; i++, p += 4) {
-      const y = (frame[p] * 77 + frame[p + 1] * 150 + frame[p + 2] * 29) >> 8;
-      curr[i] = y;
+    for (let i = 0; i < len; i++) {
+      const y = curr[i];
       lumaSum += y;
       lumaSqSum += y * y;
     }
 
-    // Texture variance gate: skip featureless dark/white frames
-    const mean = lumaSum / curr.length;
-    const variance = lumaSqSum / curr.length - mean * mean;
-    if (this.prevLuma && variance > 65) {
-      const searchR = 5;
-      const dxSamples: number[] = [];
-      const dySamples: number[] = [];
+    // 2x2 average downsample to 48x36 coarse pyramid level
+    for (let cy = 0; cy < this.coarseH; cy++) {
+      const sy = cy * 2 * w;
+      const cRow = cy * cw;
+      for (let cx = 0; cx < cw; cx++) {
+        const sx = sy + cx * 2;
+        this.coarseCurr[cRow + cx] =
+          (curr[sx] + curr[sx + 1] + curr[sx + w] + curr[sx + w + 1]) >> 2;
+      }
+    }
 
-      // Evaluate 3x3 patches across the image and take median to reject moving hands/objects
+    // Texture variance gate: skip featureless dark/saturated frames
+    const mean = lumaSum / len;
+    const variance = lumaSqSum / len - mean * mean;
+
+    if (this.hasPrevLuma && variance > 55) {
+      const coarseR = 5;
+      const fineR = 2;
+      const maxFineDx = 14;
+      const maxFineDy = 13;
+
+      let patchIdx = 0;
       for (let py = 0; py < 3; py++) {
-        const y0 = 10 + py * 18;
-        const y1 = y0 + 16;
+        // Coarse bounds in 48x36: y in [6..14], [14..22], [22..30] (+/-5 stays in 1..35)
+        const cy0 = 6 + py * 8;
+        const cy1 = cy0 + 8;
+        // Fine bounds in 96x72: y in [14..28], [28..42], [42..56] (+/-13 stays in 1..69)
+        const fy0 = 14 + py * 14;
+        const fy1 = fy0 + 14;
+
         for (let px = 0; px < 3; px++) {
-          const x0 = 12 + px * 24;
-          const x1 = x0 + 22;
+          // Coarse bounds in 48x36: x in [6..16], [18..28], [30..40] (+/-5 stays in 1..45)
+          const cx0 = 6 + px * 12;
+          const cx1 = cx0 + 10;
+          // Fine bounds in 96x72: x in [16..34], [38..56], [60..78] (+/-14 stays in 2..92)
+          const fx0 = 16 + px * 22;
+          const fx1 = fx0 + 18;
 
-          let bestDx = 0;
-          let bestDy = 0;
-          let bestSad = Number.POSITIVE_INFINITY;
-          let leftSad = 0;
-          let rightSad = 0;
-          let upSad = 0;
-          let downSad = 0;
-
-          const computeSad = (dx: number, dy: number): number => {
-            let sad = 0;
-            for (let y = y0; y < y1; y += 2) {
-              const rowA = y * w;
-              const rowB = (y + dy) * w;
-              for (let x = x0; x < x1; x += 2) {
-                sad += Math.abs(this.prevLuma![rowA + x] - curr[rowB + x + dx]);
+          // Level 1: Coarse search (±5px @ 48x36 = ±10px full-res)
+          let bestCDx = 0;
+          let bestCDy = 0;
+          let bestCSad = Number.POSITIVE_INFINITY;
+          for (let cdy = -coarseR; cdy <= coarseR; cdy++) {
+            for (let cdx = -coarseR; cdx <= coarseR; cdx++) {
+              const sad = this.computeSadBlock(
+                this.coarsePrev,
+                this.coarseCurr,
+                cw,
+                cx0,
+                cx1,
+                cy0,
+                cy1,
+                cdx,
+                cdy,
+                2
+              );
+              if (sad < bestCSad) {
+                bestCSad = sad;
+                bestCDx = cdx;
+                bestCDy = cdy;
               }
             }
-            return sad;
-          };
+          }
 
-          for (let dy = -searchR; dy <= searchR; dy++) {
-            for (let dx = -searchR; dx <= searchR; dx++) {
-              const sad = computeSad(dx, dy);
+          // Level 2: Fine search (±2px around coarse seed)
+          const seedDx = THREE.MathUtils.clamp(bestCDx * 2, -12, 12);
+          const seedDy = THREE.MathUtils.clamp(bestCDy * 2, -11, 11);
+          const minDx = Math.max(-maxFineDx, seedDx - fineR);
+          const maxDx = Math.min(maxFineDx, seedDx + fineR);
+          const minDy = Math.max(-maxFineDy, seedDy - fineR);
+          const maxDy = Math.min(maxFineDy, seedDy + fineR);
+
+          let bestDx = seedDx;
+          let bestDy = seedDy;
+          let bestSad = Number.POSITIVE_INFINITY;
+          for (let dy = minDy; dy <= maxDy; dy++) {
+            for (let dx = minDx; dx <= maxDx; dx++) {
+              const sad = this.computeSadBlock(
+                this.prevLuma,
+                curr,
+                w,
+                fx0,
+                fx1,
+                fy0,
+                fy1,
+                dx,
+                dy,
+                2
+              );
               if (sad < bestSad) {
                 bestSad = sad;
                 bestDx = dx;
@@ -1126,34 +1249,76 @@ export class SensorFusionTracker extends xb.Script {
           // Parabolic subpixel refinement along X and Y
           let subDx = bestDx;
           let subDy = bestDy;
-          if (Math.abs(bestDx) < searchR) {
-            leftSad = computeSad(bestDx - 1, bestDy);
-            rightSad = computeSad(bestDx + 1, bestDy);
+          if (bestDx > -maxFineDx && bestDx < maxFineDx) {
+            const leftSad = this.computeSadBlock(
+              this.prevLuma,
+              curr,
+              w,
+              fx0,
+              fx1,
+              fy0,
+              fy1,
+              bestDx - 1,
+              bestDy,
+              2
+            );
+            const rightSad = this.computeSadBlock(
+              this.prevLuma,
+              curr,
+              w,
+              fx0,
+              fx1,
+              fy0,
+              fy1,
+              bestDx + 1,
+              bestDy,
+              2
+            );
             const denomX = 2 * (leftSad - 2 * bestSad + rightSad);
             if (Math.abs(denomX) > 1e-3) {
               subDx += THREE.MathUtils.clamp((leftSad - rightSad) / denomX, -0.5, 0.5);
             }
           }
-          if (Math.abs(bestDy) < searchR) {
-            upSad = computeSad(bestDx, bestDy - 1);
-            downSad = computeSad(bestDx, bestDy + 1);
+          if (bestDy > -maxFineDy && bestDy < maxFineDy) {
+            const upSad = this.computeSadBlock(
+              this.prevLuma,
+              curr,
+              w,
+              fx0,
+              fx1,
+              fy0,
+              fy1,
+              bestDx,
+              bestDy - 1,
+              2
+            );
+            const downSad = this.computeSadBlock(
+              this.prevLuma,
+              curr,
+              w,
+              fx0,
+              fx1,
+              fy0,
+              fy1,
+              bestDx,
+              bestDy + 1,
+              2
+            );
             const denomY = 2 * (upSad - 2 * bestSad + downSad);
             if (Math.abs(denomY) > 1e-3) {
               subDy += THREE.MathUtils.clamp((upSad - downSad) / denomY, -0.5, 0.5);
             }
           }
 
-          dxSamples.push(subDx);
-          dySamples.push(subDy);
+          this.patchDx[patchIdx] = subDx;
+          this.patchDy[patchIdx] = subDy;
+          patchIdx += 1;
         }
       }
 
-      dxSamples.sort((a, b) => a - b);
-      dySamples.sort((a, b) => a - b);
-      const medianDx = dxSamples[4];
-      const medianDy = dySamples[4];
+      const medianDx = this.median9(this.patchDx);
+      const medianDy = this.median9(this.patchDy);
 
-      const now = performance.now();
       this.lastSeen.cameraFlow = now;
       this.sampleCount += 1;
 
@@ -1164,8 +1329,10 @@ export class SensorFusionTracker extends xb.Script {
         now - this.lastSeen.gravity < SENSOR_STALE_MS ||
         now - this.lastSeen.accel < SENSOR_STALE_MS;
 
-      // Rotate optical-flow displacement into viewer frame for landscape/portrait VR headsets
-      const angle = (window.screen?.orientation?.angle ?? 0) as number;
+      // Rotate optical-flow displacement into viewer frame for portrait/landscape headsets
+      const angle =
+        orientationAngleDeg ??
+        ((typeof window !== 'undefined' ? window.screen?.orientation?.angle : 0) || 0);
       let rotDx = medianDx;
       let rotDy = medianDy;
       if (angle === 90) {
@@ -1179,23 +1346,186 @@ export class SensorFusionTracker extends xb.Script {
         rotDy = -medianDy;
       }
 
+      // Camera FOV ~62 deg across 96px -> radPerPx:
+      // Turning head LEFT shifts world RIGHT (+rotDx) -> +dYaw (Three.js +Y rotates left)
+      // Looking UP shifts world DOWN (+rotDy) -> +dPitch (Three.js +X pitches up)
       const radPerPx = (62 * DEG_TO_RAD) / w;
-      const dYaw = Math.abs(rotDx) > 0.1 ? rotDx * radPerPx : 0;
-      const dPitch = Math.abs(rotDy) > 0.1 ? -rotDy * radPerPx : 0;
+      const dYaw = Math.abs(rotDx) > 0.06 ? rotDx * radPerPx : 0;
+      const dPitch = Math.abs(rotDy) > 0.06 ? rotDy * radPerPx : 0;
 
-      // Auto-supply full left/right yaw whenever gyro/absQuat/compass aren't driving yaw!
-      if (this.mode === 'camera-flow' || (!hasGyro && !hasCompass && !hasAbsQuat)) {
-        this.yawRad += dYaw * 1.28;
-      } else if (!hasGyro && !hasAbsQuat && hasCompass) {
-        this.yawRad += dYaw * 0.72;
+      // Rotationally invariant 2D Curl for visual head Roll (tilt left/right)
+      const topRowDx = (this.patchDx[0] + this.patchDx[1] + this.patchDx[2]) / 3;
+      const botRowDx = (this.patchDx[6] + this.patchDx[7] + this.patchDx[8]) / 3;
+      const leftColDy = (this.patchDy[0] + this.patchDy[3] + this.patchDy[6]) / 3;
+      const rightColDy = (this.patchDy[2] + this.patchDy[5] + this.patchDy[8]) / 3;
+      const rollCurl = ((topRowDx - botRowDx) / 28 + (rightColDy - leftColDy) / 44) * 0.5;
+      const dRoll = Math.abs(rollCurl) > 0.004 ? THREE.MathUtils.clamp(rollCurl * 0.72, -0.14, 0.14) : 0;
+
+      // Rotationally invariant 2D Radial Divergence (forward motion toward scene expands image)
+      const leftColDx = (this.patchDx[0] + this.patchDx[3] + this.patchDx[6]) / 3;
+      const rightColDx = (this.patchDx[2] + this.patchDx[5] + this.patchDx[8]) / 3;
+      const topRowDy = (this.patchDy[0] + this.patchDy[1] + this.patchDy[2]) / 3;
+      const botRowDy = (this.patchDy[6] + this.patchDy[7] + this.patchDy[8]) / 3;
+      const horizExp = rightColDx - leftColDx;
+      const vertExp = botRowDy - topRowDy;
+      const radialExp = (horizExp / 44 + vertExp / 28) * 0.5;
+      const divRate = radialExp / Math.max(dtSec, 0.016);
+      this.visDivergenceLp = THREE.MathUtils.lerp(this.visDivergenceLp, divRate, 0.25);
+      // Coherent expansion: both axes must genuinely expand outward over multiple frames while not rotating fast
+      if (
+        horizExp > 0.18 &&
+        vertExp > 0.12 &&
+        Math.abs(rotDx) < 1.5 &&
+        Math.abs(rotDy) < 1.5 &&
+        Math.abs(this.visVySmooth) < 35
+      ) {
+        this.visForwardHoldFrames = Math.min(20, this.visForwardHoldFrames + 1);
+      } else {
+        this.visForwardHoldFrames = Math.max(0, this.visForwardHoldFrames - 2);
+      }
+      this.visCoherentForward = this.visForwardHoldFrames >= 5;
+
+      if (this.mode === 'camera-flow') {
+        this.yawRad += dYaw * 1.18;
+        this.pitchRad = THREE.MathUtils.clamp(this.pitchRad + dPitch * 1.12, -1.38, 1.38);
+        this.rollRad = THREE.MathUtils.clamp(this.rollRad * 0.94 + dRoll, -0.78, 0.78);
+        this.rawCompassDeg = (((-this.yawRad * RAD_TO_DEG) % 360) + 360) % 360;
+        this.fusionAlgorithmLabel = 'Back-Cam Optical 6DoF';
+      } else {
+        if (!hasGyro && !hasCompass && !hasAbsQuat) {
+          this.yawRad += dYaw * 1.22;
+        } else if (!hasGyro && !hasAbsQuat && hasCompass) {
+          this.yawRad += dYaw * 0.72;
+        }
+        if (!hasGyro && !hasGravity && !hasAbsQuat) {
+          this.pitchRad = THREE.MathUtils.clamp(this.pitchRad + dPitch * 1.12, -1.38, 1.38);
+        }
       }
 
-      if (this.mode === 'camera-flow' || (!hasGyro && !hasGravity && !hasAbsQuat)) {
-        this.pitchRad = THREE.MathUtils.clamp(this.pitchRad + dPitch * 1.15, -1.38, 1.38);
+      // Visual Walk / Run / Jump detection from Back-Camera stride bounce & forward expansion
+      if (
+        this.locomotionEnabled &&
+        (this.mode === 'camera-flow' || now - this.lastSeen.linearAccel > 400)
+      ) {
+        this.processVisualCameraLocomotion(rotDx, rotDy, dtSec, now);
       }
+    } else if (this.cameraFlowEnabled) {
+      this.lastSeen.cameraFlow = now;
     }
 
-    this.prevLuma = curr;
+    this.prevLuma.set(curr);
+    this.coarsePrev.set(this.coarseCurr);
+    this.hasPrevLuma = true;
+  }
+
+  private processVisualCameraLocomotion(
+    rotDx: number,
+    rotDy: number,
+    dtSec: number,
+    now: number
+  ): void {
+    const safeDt = Math.max(dtSec, 0.016);
+    // +vy: camera moving UP -> world moves DOWN (+rotDy)
+    const rawVy = rotDy / safeDt;
+    this.visVySmooth = THREE.MathUtils.lerp(this.visVySmooth, rawVy, 0.52);
+    const vy = this.visVySmooth;
+    const vxAbs = Math.abs(rotDx / safeDt);
+
+    // High-pass filter isolates rhythmic step bobs & jump impulses from slow head pitch
+    this.visVertLp = THREE.MathUtils.lerp(this.visVertLp, vy, Math.min(1, safeDt * 2.8));
+    const vertHp = vy - this.visVertLp;
+    this.latestVertAcc = Number((vertHp * 0.18).toFixed(1));
+
+    // 1. Visual Jump Detector: Leg push-off surge (+vy upward) followed by apex fall (-vy downward)
+    const jumpLaunchVyMin = this.locomotionState === 'run' || this.visPeakNeg > 30 ? 64 : 50;
+    const jumpLaunchHpMin = this.locomotionState === 'run' || this.visPeakNeg > 30 ? 48 : 38;
+    if (vy > jumpLaunchVyMin && vertHp > jumpLaunchHpMin && vxAbs < Math.abs(vy) * 1.15) {
+      this.visJumpPrimedUntil = now + 520;
+    }
+    if (
+      !this.isAirborne &&
+      now > this.jumpCooldownUntil &&
+      now <= this.visJumpPrimedUntil &&
+      (vy < -24 || vertHp < -22)
+    ) {
+      this.visJumpPrimedUntil = 0;
+      this.visPeakPos = 0;
+      this.visPeakNeg = 0;
+      this.triggerJump();
+      return;
+    }
+
+    if (this.isAirborne || now < this.jumpCooldownUntil - 100) {
+      this.visPeakPos = 0;
+      this.visPeakNeg = 0;
+      return;
+    }
+
+    // 2. Visual Walk / Run Stride Bounce & Radial Expansion Detector
+    // Use ~600ms envelope memory so first half-stride peak persists until opposite footstrike
+    const envDecay = Math.exp(-safeDt * 1.15);
+    this.visPeakPos = Math.max(this.visPeakPos * envDecay, vertHp > 0 ? vertHp : 0);
+    this.visPeakNeg = Math.max(this.visPeakNeg * envDecay, vertHp < 0 ? -vertHp : 0);
+    const bounceAmp = this.visPeakPos + this.visPeakNeg;
+
+    const isFastVisualMotion =
+      bounceAmp > 46 || (this.visCoherentForward && this.visDivergenceLp > 0.48);
+    const hasStepOscillation =
+      this.visPeakPos > 8.5 &&
+      this.visPeakNeg > 8.5 &&
+      bounceAmp > 18 &&
+      vertHp < -5.5 &&
+      vy < -4.0;
+    const spanSinceLast = this.lastStepAt > 0 ? now - this.lastStepAt : 560;
+    const isRapidStride =
+      hasStepOscillation &&
+      this.visPeakPos > 15 &&
+      this.visPeakNeg > 15 &&
+      spanSinceLast > 180 &&
+      spanSinceLast < 395;
+    const isRunningVisual = isFastVisualMotion || isRapidStride;
+    const minStrideIntervalMs = isRunningVisual ? 260 : 490;
+    if (now - this.lastStepAt < minStrideIntervalMs) return;
+
+    const hasForwardCruise = this.visCoherentForward && this.visDivergenceLp > 0.14;
+
+    if (hasStepOscillation || hasForwardCruise) {
+      const equivAccel = isRunningVisual
+        ? Math.max(4.9, THREE.MathUtils.clamp(bounceAmp * 0.11, 4.9, 6.2))
+        : THREE.MathUtils.clamp(Math.max(2.3, bounceAmp * 0.085), 2.3, 3.6);
+      this.registerStep(now, equivAccel);
+      this.visPeakPos *= 0.2;
+      this.visPeakNeg *= 0.2;
+    }
+  }
+
+  /**
+   * 3x3 Multi-Patch Median-Consensus Optical Flow with 2-level coarse-to-fine pyramid.
+   */
+  private sampleCameraOpticalFlow(dt: number): void {
+    if (
+      (!this.cameraFlowEnabled && !this.autoFlowEnabled) ||
+      !this.cameraVideo ||
+      !this.flowCtx ||
+      this.cameraVideo.readyState < 2
+    ) {
+      return;
+    }
+
+    this.flowSampleAccum += dt;
+    if (this.flowSampleAccum < 1 / 30) return;
+    const sampleDt = this.flowSampleAccum;
+    this.flowSampleAccum = 0;
+
+    const w = this.flowW;
+    const h = this.flowH;
+    this.flowCtx.drawImage(this.cameraVideo, 0, 0, w, h);
+    const frame = this.flowCtx.getImageData(0, 0, w, h).data;
+    for (let i = 0, p = 0; i < this.currLuma.length; i++, p += 4) {
+      this.currLuma[i] = (frame[p] * 77 + frame[p + 1] * 150 + frame[p + 2] * 29) >> 8;
+    }
+
+    this.processCameraLumaFrame(this.currLuma, sampleDt, performance.now());
   }
 
   private shortestAngleDiff(from: number, to: number): number {
@@ -1214,10 +1544,23 @@ export class SensorFusionTracker extends xb.Script {
     this.jumpHeightY = 0;
     this.jumpVelY = 0;
     this.isAirborne = false;
+    this.hasPrevLuma = false;
+    this.visVertLp = 0;
+    this.visVySmooth = 0;
+    this.visPeakPos = 0;
+    this.visPeakNeg = 0;
+    this.visForwardHoldFrames = 0;
+    this.visCoherentForward = false;
+    this.visDivergenceLp = 0;
+    this.visJumpPrimedUntil = 0;
   }
 
   setMode(mode: SensorTrackingMode): void {
     this.mode = mode;
+    this.switchedToCameraFlowByToggle = false;
+    if (mode === 'camera-flow' && !this.cameraFlowEnabled) {
+      void this.toggleCameraOpticalFlow();
+    }
   }
 
   getMode(): SensorTrackingMode {
@@ -1364,6 +1707,7 @@ export class SensorFusionTracker extends xb.Script {
       hw.gyro ||
       hw.accel ||
       hw.cameraFlow ||
+      this.mode === 'camera-flow' ||
       now - this.lastSeen.keyboard < 5000 ||
       this.demoSweepActive;
 
@@ -1541,6 +1885,10 @@ export class SensorFusionTracker extends xb.Script {
       statusLabel = 'Simulated Head Sweep';
     } else if (this.mode === 'off') {
       statusLabel = 'Sensor Tracking Paused';
+    } else if (this.mode === 'camera-flow') {
+      statusLabel = hw.cameraFlow
+        ? 'Back-Cam Head & Walk/Run/Jump Active'
+        : 'Starting Back-Camera Tracking...';
     } else if (activeSources.length > 0) {
       statusLabel = `Fusing: ${activeSources.join(' + ')}`;
     } else if (this.permissionState === 'denied') {

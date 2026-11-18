@@ -92,7 +92,7 @@ export class SensorCalibrationCard extends xb.UICard {
       style: {flexGrow: 1},
     });
     const camFlowBtn = new xb.UIButton({
-      label: 'Cam Flow: OFF',
+      label: 'Back-Cam Head: OFF',
       icon: 'videocam',
       style: {flexGrow: 1},
     });
@@ -364,9 +364,10 @@ export class SensorCalibrationCard extends xb.UICard {
     this.camFlowBtn.onClick = () => {
       this.sound.playClick();
       this.camFlowBtn.disabled = true;
+      this.camFlowBtn.label = 'Starting Cam...';
       void this.sensors.toggleCameraOpticalFlow().then((active) => {
         this.camFlowBtn.disabled = false;
-        this.camFlowBtn.label = active ? 'Cam Flow: ON' : 'Cam Flow: OFF';
+        this.camFlowBtn.label = active ? 'Back-Cam Head: ON' : 'Back-Cam Head: OFF';
         this.refreshTelemetry();
       });
     };
@@ -423,7 +424,7 @@ export class SensorCalibrationCard extends xb.UICard {
       {id: 'auto', label: 'Mode: Auto All-HW'},
       {id: 'fusion', label: 'Mode: Compass + Accel'},
       {id: 'compass-only', label: 'Mode: Compass Only'},
-      {id: 'camera-flow', label: 'Mode: Camera Flow'},
+      {id: 'camera-flow', label: 'Mode: Back-Cam 6DoF'},
       {id: 'off', label: 'Mode: Tracking Off'},
     ];
     this.modeBtn.onClick = () => {
@@ -568,6 +569,26 @@ export class SensorCalibrationCard extends xb.UICard {
             ? '#34d399'
             : '#94a3b8';
 
+    if (!this.camFlowBtn.disabled) {
+      const expectedCamFlow = this.sensors.isCameraFlowEnabled()
+        ? 'Back-Cam Head: ON'
+        : 'Back-Cam Head: OFF';
+      if (this.camFlowBtn.label !== expectedCamFlow) {
+        this.camFlowBtn.label = expectedCamFlow;
+      }
+    }
+    const modeLabels: Record<SensorTrackingMode, string> = {
+      auto: 'Mode: Auto All-HW',
+      fusion: 'Mode: Compass + Accel',
+      'compass-only': 'Mode: Compass Only',
+      'camera-flow': 'Mode: Back-Cam 6DoF',
+      off: 'Mode: Tracking Off',
+    };
+    const expectedModeLabel = modeLabels[tel.mode];
+    if (this.modeBtn.label !== expectedModeLabel) {
+      this.modeBtn.label = expectedModeLabel;
+    }
+
     if (this.gestures) {
       const g = this.gestures.getTelemetry();
       if (!g.cameraHandsLoading) {
@@ -593,17 +614,27 @@ export class SensorCalibrationCard extends xb.UICard {
           : `${g.activeGesture.toUpperCase()} (${g.activeHand})`;
       const headLabel = g.headGesture === 'none' ? '--' : g.headGesture.toUpperCase();
       this.gestureText.text = `Hands: ${handSrc} • Gesture: ${gestLabel} • Head: ${headLabel}`;
-      this.fallbackHintText.text = g.lastActionLabel;
+      if (tel.mode === 'camera-flow') {
+        this.fallbackHintText.text = hw.cameraFlow
+          ? 'Back Camera tracks Left/Right/Up/Down head turns + Walk, Run & Jump!'
+          : 'Allow camera permission to track head turns + Walk/Run/Jump.';
+      } else {
+        this.fallbackHintText.text = g.lastActionLabel;
+      }
+    } else if (tel.mode === 'camera-flow') {
+      this.fallbackHintText.text = hw.cameraFlow
+        ? 'Back Camera tracks Left/Right/Up/Down head turns + Walk, Run & Jump!'
+        : 'Allow camera permission to track head turns + Walk/Run/Jump.';
     } else if (hw.gyro && hw.compass && hw.accel) {
       this.fallbackHintText.text = tel.gyroCalibrated
         ? 'Full 9-axis hardware fusion + drift bias calibration active.'
         : 'Full 9-axis hardware fusion active.';
     } else if (hw.accel && !hw.compass && !hw.gyro && !hw.cameraFlow) {
       this.fallbackHintText.text =
-        'No Gyro/Compass detected: Accel tracks tilt; tap Cam Flow: ON for 360° yaw!';
+        'No Gyro/Compass detected: Accel tracks tilt; tap Back-Cam Head: ON for 360° yaw!';
     } else if (hw.cameraFlow) {
       this.fallbackHintText.text =
-        '3x3 subpixel Camera Optical Flow tracking pan/tilt with available sensors.';
+        '2-Level Pyramid Back-Cam tracking pan/tilt + Walk/Run/Jump.';
     } else {
       this.fallbackHintText.text = `Active fallback pipeline: ${tel.activeSourcesLabel}`;
     }

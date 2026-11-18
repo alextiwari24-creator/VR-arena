@@ -298,6 +298,10 @@ export class VirtualPlayBrowserCard extends xb.UICard {
     void this.navigateHome();
   }
 
+  public getScrollView(): xb.UIScrollView {
+    return this.viewport;
+  }
+
   private wireControls(): void {
     this.backBtn.onClick = () => {
       this.sound.playClick();

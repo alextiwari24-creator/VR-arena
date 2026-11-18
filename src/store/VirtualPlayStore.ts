@@ -36,10 +36,13 @@ interface AppRowBinding {
   progressTrack: xb.UIPanel;
 }
 
+export type InstallTargetMode = 'vr-wrapper' | 'head-gaze' | 'play-market';
+
 export class VirtualPlayStore extends xb.UICard {
   private readonly theater: VRGameTheater;
   private readonly sound: SoundEngine;
   private readonly onLaunchInVRMode?: (app: PlayStoreAppItem) => void;
+  private readonly onInspectApp?: (app: PlayStoreAppItem) => void;
 
   private catalog: PlayStoreAppItem[] = [...PLAY_STORE_CATALOG];
   private installStates = new Map<string, AppInstallState>();
@@ -48,6 +51,7 @@ export class VirtualPlayStore extends xb.UICard {
   private stateListeners = new Set<() => void>();
 
   private activeCategory: StoreCategory = 'all';
+  private installMode: InstallTargetMode = 'vr-wrapper';
   private searchQuery = '';
   private liveFetchSeq = 0;
   private fetchedLiveCount = 0;
@@ -55,6 +59,7 @@ export class VirtualPlayStore extends xb.UICard {
   private searchInput: xb.UITextInput;
   private fetchPlayBtn: xb.UIButton;
   private sideloadBtn: xb.UIButton;
+  private installModeBtn: xb.UIButton;
   private googleAuthBtn: xb.UIButton;
   private statusBanner: xb.UIText;
   private scrollView: xb.UIScrollView;
@@ -68,7 +73,8 @@ export class VirtualPlayStore extends xb.UICard {
   constructor(
     theater: VRGameTheater,
     sound: SoundEngine,
-    onLaunchInVRMode?: (app: PlayStoreAppItem) => void
+    onLaunchInVRMode?: (app: PlayStoreAppItem) => void,
+    onInspectApp?: (app: PlayStoreAppItem) => void
   ) {
     const statusBanner = new xb.UIText({
       text: 'Fetching live Google Play Store VR catalog... Gaze Download or Install.',
@@ -96,7 +102,17 @@ export class VirtualPlayStore extends xb.UICard {
     const googleAuthBtn = new xb.UIButton({
       label: 'Google Sign-In',
       icon: 'account_circle',
-      style: {height: 32, fontSize: 12},
+      style: {height: 34, fontSize: 12, ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.25)'}},
+    });
+
+    const installModeBtn = new xb.UIButton({
+      label: 'Option: VR Wrapper',
+      icon: 'install_mobile',
+      style: {
+        height: 34,
+        fontSize: 11.5,
+        ':hover': {backgroundColor: 'rgba(52, 211, 153, 0.25)'},
+      },
     });
 
     const scrollView = new xb.UIScrollView({
@@ -111,14 +127,24 @@ export class VirtualPlayStore extends xb.UICard {
     });
 
     const pageUpBtn = new xb.UIButton({
-      label: 'Page Up',
+      label: 'Scroll Up',
       icon: 'keyboard_arrow_up',
-      style: {flexGrow: 1, height: 30, fontSize: 11.5},
+      style: {
+        flexGrow: 1,
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.25)'},
+      },
     });
     const pageDownBtn = new xb.UIButton({
-      label: 'Page Down',
+      label: 'Scroll Down',
       icon: 'keyboard_arrow_down',
-      style: {flexGrow: 1, height: 30, fontSize: 11.5},
+      style: {
+        flexGrow: 1,
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.25)'},
+      },
     });
 
     const categories: Array<{id: StoreCategory; label: string}> = [
@@ -171,6 +197,7 @@ export class VirtualPlayStore extends xb.UICard {
             flexDirection: 'row',
             justifyContent: 'space-between',
             alignItems: 'center',
+            gap: 6,
           },
           children: [
             new xb.UIPanel({
@@ -186,7 +213,10 @@ export class VirtualPlayStore extends xb.UICard {
                 }),
               ],
             }),
-            googleAuthBtn,
+            new xb.UIPanel({
+              style: {flexDirection: 'row', gap: 6, alignItems: 'center'},
+              children: [installModeBtn, googleAuthBtn],
+            }),
           ],
         }),
         new xb.UIPanel({
@@ -211,9 +241,11 @@ export class VirtualPlayStore extends xb.UICard {
     this.theater = theater;
     this.sound = sound;
     this.onLaunchInVRMode = onLaunchInVRMode;
+    this.onInspectApp = onInspectApp;
     this.searchInput = searchInput;
     this.fetchPlayBtn = fetchPlayBtn;
     this.sideloadBtn = sideloadBtn;
+    this.installModeBtn = installModeBtn;
     this.googleAuthBtn = googleAuthBtn;
     this.statusBanner = statusBanner;
     this.scrollView = scrollView;
@@ -307,6 +339,14 @@ export class VirtualPlayStore extends xb.UICard {
     this.rebuildRows();
     this.statusBanner.text = 'Restored all default Google & VR starter apps.';
     this.emitStateChange();
+  }
+
+  public getScrollView(): xb.UIScrollView {
+    return this.scrollView;
+  }
+
+  public openPlayStoreLink(app: PlayStoreAppItem): void {
+    this.handleDownloadFromPlayStore(app);
   }
 
   public launchAppInVR(app: PlayStoreAppItem): void {
@@ -440,6 +480,25 @@ export class VirtualPlayStore extends xb.UICard {
     this.pageDownBtn.onClick = () => {
       this.sound.playClick();
       this.scrollView.scrollTop = this.scrollView.scrollTop + 210;
+    };
+
+    this.installModeBtn.onClick = () => {
+      this.sound.playClick();
+      const order: InstallTargetMode[] = ['vr-wrapper', 'head-gaze', 'play-market'];
+      const next = order[(order.indexOf(this.installMode) + 1) % order.length];
+      this.installMode = next;
+      this.installModeBtn.label =
+        next === 'vr-wrapper'
+          ? 'Option: VR Wrapper'
+          : next === 'head-gaze'
+            ? 'Option: Head-Gaze'
+            : 'Option: Play Link';
+      this.statusBanner.text =
+        next === 'vr-wrapper'
+          ? 'Install Option: Wraps Android APK into Stereoscopic VR Theater.'
+          : next === 'head-gaze'
+            ? 'Install Option: Configures 9-DoF Head-Gaze & Single-Button Control.'
+            : 'Install Option: Opens official Google Play Store download directly.';
     };
 
     for (const [catId, btn] of this.categoryButtons.entries()) {
@@ -681,17 +740,39 @@ export class VirtualPlayStore extends xb.UICard {
       children: [progressFill],
     });
 
+    const infoBtn = new xb.UIButton({
+      label: 'Info',
+      icon: 'info',
+      style: {
+        height: 36,
+        fontSize: 12,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.25)'},
+      },
+      onClick: () => {
+        this.sound.playClick();
+        this.onInspectApp?.(app);
+      },
+    });
+
     const primaryBtn = new xb.UIButton({
       label: 'Install VR',
       icon: 'download',
-      style: {height: 34, fontSize: 12.5},
+      style: {
+        height: 36,
+        fontSize: 12.5,
+        ':hover': {backgroundColor: 'rgba(56, 189, 248, 0.35)'},
+      },
       onClick: () => this.handlePrimaryAction(app),
     });
 
     const downloadBtn = new xb.UIButton({
       label: 'Download',
       icon: 'shop',
-      style: {height: 34, fontSize: 12.5},
+      style: {
+        height: 36,
+        fontSize: 12.5,
+        ':hover': {backgroundColor: 'rgba(52, 211, 153, 0.28)'},
+      },
       onClick: () => this.handleDownloadFromPlayStore(app),
     });
 
@@ -733,8 +814,8 @@ export class VirtualPlayStore extends xb.UICard {
         }),
         progressTrack,
         new xb.UIPanel({
-          style: {width: '100%', flexDirection: 'row', gap: 8, justifyContent: 'flex-end'},
-          children: [downloadBtn, primaryBtn],
+          style: {width: '100%', flexDirection: 'row', gap: 7, justifyContent: 'flex-end'},
+          children: [infoBtn, downloadBtn, primaryBtn],
         }),
       ],
     });
@@ -755,6 +836,8 @@ export class VirtualPlayStore extends xb.UICard {
     const state = this.installStates.get(app.id);
     if (state?.stage === 'installed') {
       this.launchAppInVR(app);
+    } else if (this.installMode === 'play-market') {
+      this.handleDownloadFromPlayStore(app);
     } else if (!state || state.stage === 'idle') {
       this.startInstall(app);
     }
