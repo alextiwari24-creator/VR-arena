@@ -126,7 +126,10 @@ export class VRStoreHubApp extends xb.Script {
       onBack: () => this.appInfoCard?.close() ?? false,
       onToggleStereo: () => this.toggleStereoView(),
       onJump: () => this.theater.triggerLocomotionJump(),
-      onStep: (running) => this.theater.triggerLocomotionStep(running),
+      onStep: (running, moveDirection) =>
+        this.theater.triggerLocomotionStep(running, moveDirection),
+      onLocomotionFrame: (state, moveDirection, crouching, speedMps, jumpHeightM) =>
+        this.theater.updateLocomotionFrame(state, moveDirection, crouching, speedMps, jumpHeightM),
       onStatusUpdate: (label) => {
         if (this.hudGestureText) this.hudGestureText.text = label;
       },
@@ -324,6 +327,7 @@ export class VRStoreHubApp extends xb.Script {
    */
   private launchAppDirectlyIntoVR(app: PlayStoreAppItem): void {
     this.appInfoCard.close();
+    void this.sensors.ensureCameraFlowStarted();
     const renderer = xb.core.renderer as THREE.WebGLRenderer | undefined;
     const isXrPresenting = Boolean(renderer?.xr?.isPresenting);
     if (!isXrPresenting && !this.vrEngine.isStereoEnabled()) {
@@ -408,7 +412,7 @@ export class VRStoreHubApp extends xb.Script {
 
   private createHudOverlay(): xb.UIOverlay {
     this.hudTitleText = new xb.UIText({
-      text: 'VR Hub • 16 Google Apps Ready • Gaze 1s / Nod = Click',
+      text: 'VR Hub • Back-Cam Auto: Walk/Run/Jump/Crouch/Turn + 1s Gaze',
       style: {fontSize: 13.5, fontWeight: 'bold', flexGrow: 1},
     });
     this.hudGestureText = new xb.UIText({
@@ -688,7 +692,7 @@ export class VRStoreHubApp extends xb.Script {
     if (!app) {
       this.activeSessionAppName = null;
       this.launcherCard.setActiveRunningApp(null);
-      this.hudTitleText.text = 'VR Hub • Look + Space/Tap/Dwell 1s = Select • Esc/Shake = Back';
+      this.hudTitleText.text = 'VR Hub • Back-Cam Auto: Walk/Run/Jump/Crouch/Turn + 1s Gaze';
       this.exitGameBtn.visible = false;
       this.cinemaPlayBtn.visible = false;
       this.cinemaDimBtn.visible = false;

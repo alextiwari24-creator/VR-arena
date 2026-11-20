@@ -15,7 +15,14 @@ export interface HeadGazeCallbacks {
   onBack?: () => boolean;
   onToggleStereo?: () => void;
   onJump?: () => void;
-  onStep?: (running: boolean) => void;
+  onStep?: (running: boolean, moveDirection: 'forward' | 'backward') => void;
+  onLocomotionFrame?: (
+    state: 'idle' | 'walk' | 'run' | 'jump' | 'crouch',
+    moveDirection: 'forward' | 'backward',
+    crouching: boolean,
+    speedMps: number,
+    jumpHeightM: number
+  ) => void;
   onStatusUpdate?: (label: string) => void;
 }
 
@@ -416,6 +423,13 @@ export class HeadGazeController extends xb.Script {
     const motion = this.sensors.consumeHeadMotionSignals();
 
     // Handle Walk / Run / Jump / Crouch physical sensor & back-camera events regardless of gaze toggle
+    this.callbacks.onLocomotionFrame?.(
+      motion.locoState,
+      motion.moveDirection,
+      motion.crouching,
+      motion.speedMps,
+      motion.jumpHeightM
+    );
     if (motion.jumped) {
       this.sound.playJump();
       this.callbacks.onJump?.();
@@ -425,7 +439,7 @@ export class HeadGazeController extends xb.Script {
     } else if (motion.stepEvent !== 'none') {
       const running = motion.stepEvent === 'run';
       this.sound.playFootstep(running);
-      this.callbacks.onStep?.(running);
+      this.callbacks.onStep?.(running, motion.moveDirection);
       const label = running
         ? 'Sensed: RUNNING!'
         : motion.moveDirection === 'backward'
@@ -622,11 +636,12 @@ export class HeadGazeController extends xb.Script {
 
       if (!isDisabledBtn) {
         this.dwellElapsed += dt;
+        const droneDwell = motion.locoState === 'run' ? DWELL_DRONE_SEC * 0.52 : DWELL_DRONE_SEC;
         const requiredSec =
           hitKind === 'slider'
             ? DWELL_SLIDER_SEC
             : hitKind === 'toy' && mode === 'cosmic-blaster'
-              ? DWELL_DRONE_SEC
+              ? droneDwell
               : hitKind === 'screen'
                 ? DWELL_SCREEN_SEC
                 : DWELL_UI_SEC;

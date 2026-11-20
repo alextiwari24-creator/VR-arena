@@ -32,6 +32,14 @@ interface RacerObstacle {
   lane: number; // -1..1
   z: number; // 0 (horizon) .. 1 (player)
   isOrb: boolean;
+  isHighGate: boolean; // Overhead laser beam cleared by crouching/ducking
+  active: boolean;
+}
+
+interface DroneHazard {
+  mesh: THREE.Mesh;
+  velocity: THREE.Vector3;
+  life: number;
   active: boolean;
 }
 
@@ -39,6 +47,7 @@ const LOGICAL_W = 1024;
 const LOGICAL_H = 512;
 const TARGET_POOL_SIZE = 14;
 const BOLT_POOL_SIZE = 24;
+const HAZARD_POOL_SIZE = 6;
 const OBSTACLE_POOL_SIZE = 32;
 const BOLT_Z_AXIS = new THREE.Vector3(0, 0, 1);
 
@@ -98,15 +107,44 @@ export class VRGameTheater extends xb.Script {
 
   // Neon Racer pre-allocated obstacle pool (zero GC)
   private racerX = 0; // -1..1
-  private racerSpeed = 0.65;
+  private racerSpeed = 0.72;
   private racerRoadScroll = 0;
   private racerObstaclePool: RacerObstacle[] = [];
   private racerSpawnTimer = 0;
   private racerFlash = 0;
+  private racerJumpY = 0;
+  private racerJumpVelY = 0;
+  private racerAirborne = false;
+  private racerBannerText = '';
+  private racerBannerTimer = 0;
+
+  // Cosmic Blaster drone plasma hazards & Jump Shockwave (zero GC)
+  private hazardPool: DroneHazard[] = [];
+  private hazardGeo = new THREE.SphereGeometry(0.085, 8, 6);
+  private hazardMat = new THREE.MeshBasicMaterial({color: 0xfbbf24});
+  private hazardTimer = 1.6;
+  private shockwaveGeo = new THREE.TorusGeometry(0.6, 0.045, 6, 24);
+  private shockwaveMat = new THREE.MeshBasicMaterial({
+    color: 0x38bdf8,
+    transparent: true,
+    opacity: 0.85,
+  });
+  private shockwaveRing!: THREE.Mesh;
+  private shockwaveTimer = 0;
+  private blasterBannerText = '';
+  private blasterBannerTimer = 0;
+
+  // Live Back-Camera / IMU Locomotion mirror
+  private liveLocoState: 'idle' | 'walk' | 'run' | 'jump' | 'crouch' = 'idle';
+  private liveMoveDirection: 'forward' | 'backward' = 'forward';
+  private liveCrouching = false;
+  private liveSpeedMps = 0;
+  private liveJumpHeightM = 0;
 
   // Reusable scratch vectors (zero GC in loop)
   private readonly _rayOrigin = new THREE.Vector3();
   private readonly _rayDir = new THREE.Vector3();
+  private readonly _camPosScratch = new THREE.Vector3();
   private readonly _quat = new THREE.Quaternion();
   private drawTimer = 0;
   private elapsed = 0;
@@ -184,11 +222,31 @@ export class VRGameTheater extends xb.Script {
       });
     }
 
+    for (let i = 0; i < HAZARD_POOL_SIZE; i++) {
+      const mesh = new THREE.Mesh(this.hazardGeo, this.hazardMat);
+      mesh.xb = {pointerEvents: 'none'};
+      mesh.visible = false;
+      this.gameGroup.add(mesh);
+      this.hazardPool.push({
+        mesh,
+        velocity: new THREE.Vector3(),
+        life: 0,
+        active: false,
+      });
+    }
+
+    this.shockwaveGeo.rotateX(Math.PI / 2);
+    this.shockwaveRing = new THREE.Mesh(this.shockwaveGeo, this.shockwaveMat);
+    this.shockwaveRing.xb = {pointerEvents: 'none'};
+    this.shockwaveRing.visible = false;
+    this.gameGroup.add(this.shockwaveRing);
+
     for (let i = 0; i < OBSTACLE_POOL_SIZE; i++) {
       this.racerObstaclePool.push({
         lane: 0,
         z: 0,
         isOrb: false,
+        isHighGate: false,
         active: false,
       });
     }
@@ -261,11 +319,20 @@ export class VRGameTheater extends xb.Script {
 
     if (this.mode === 'cosmic-blaster') {
       this.env.setTheaterDim(0.7);
+      this.hazardTimer = 1.4;
+      this.shockwaveTimer = 0;
+      this.blasterBannerText = 'WALK / RUN / JUMP / CROUCH LIVE!';
+      this.blasterBannerTimer = 2.2;
       this.spawnWaveTargets(5);
     } else if (this.mode === 'neon-racer') {
       this.env.setTheaterDim(0.55);
       this.racerX = 0;
-      this.racerSpeed = 0.65;
+      this.racerSpeed = 0.72;
+      this.racerJumpY = 0;
+      this.racerJumpVelY = 0;
+      this.racerAirborne = false;
+      this.racerBannerText = 'WALK / RUN / JUMP / DUCK / TURN!';
+      this.racerBannerTimer = 2.4;
       for (let i = 0; i < this.racerObstaclePool.length; i++) {
         this.racerObstaclePool[i].active = false;
       }
@@ -403,32 +470,114 @@ export class VRGameTheater extends xb.Script {
     return this.mode;
   }
 
+  updateLocomotionFrame(
+    state: 'idle' | 'walk' | 'run' | 'jump' | 'crouch',
+    moveDirection: 'forward' | 'backward',
+    crouching: boolean,
+    speedMps: number,
+    jumpHeightM: number
+  ): void {
+    this.liveLocoState = state;
+    this.liveMoveDirection = moveDirection;
+    this.liveCrouching = crouching;
+    this.liveSpeedMps = speedMps;
+    this.liveJumpHeightM = jumpHeightM;
+  }
+
   triggerRacerBoost(): void {
     if (this.mode !== 'neon-racer') return;
     this.racerSpeed = Math.min(1.85, this.racerSpeed + 0.25);
     this.score += 25;
     if (this.score > this.highScore) this.highScore = this.score;
+    this.racerBannerText = 'NITRO BOOST +25';
+    this.racerBannerTimer = 1.1;
     this.sound.playPickup();
     this.onSessionChange?.(this.activeApp, this.score);
   }
 
-  triggerLocomotionStep(running: boolean): void {
-    if (this.mode === 'neon-racer' && running) {
-      this.racerSpeed = Math.min(1.85, this.racerSpeed + 0.1);
-      this.score += 10;
-      if (this.score > this.highScore) this.highScore = this.score;
-      this.onSessionChange?.(this.activeApp, this.score);
+  triggerLocomotionStep(
+    running: boolean,
+    moveDirection: 'forward' | 'backward' = 'forward'
+  ): void {
+    if (this.mode === 'neon-racer') {
+      if (moveDirection === 'backward') {
+        this.racerSpeed = Math.max(0.45, this.racerSpeed - 0.14);
+        this.racerBannerText = 'BACK-WALK BRAKE';
+        this.racerBannerTimer = 0.8;
+      } else if (running) {
+        this.racerSpeed = Math.min(1.85, this.racerSpeed + 0.14);
+        this.score += 15;
+        if (this.score > this.highScore) this.highScore = this.score;
+        this.racerBannerText = 'TURBO RUN +15';
+        this.racerBannerTimer = 0.9;
+        this.onSessionChange?.(this.activeApp, this.score);
+      } else {
+        this.racerSpeed = Math.min(1.5, Math.max(this.racerSpeed + 0.04, 0.95));
+        this.score += 5;
+        if (this.score > this.highScore) this.highScore = this.score;
+        this.onSessionChange?.(this.activeApp, this.score);
+      }
+    } else if (this.mode === 'cosmic-blaster' && running) {
+      this.blasterBannerText = 'RUN OVERDRIVE x2 LOCK';
+      this.blasterBannerTimer = 1.0;
     }
   }
 
   triggerLocomotionJump(): void {
     if (this.mode === 'neon-racer') {
+      if (!this.racerAirborne) {
+        this.racerAirborne = true;
+        this.racerJumpVelY = 4.25;
+      }
       this.score += 60;
       this.racerSpeed = Math.min(1.85, this.racerSpeed + 0.22);
       if (this.score > this.highScore) this.highScore = this.score;
+      this.racerBannerText = 'JUMP AIRBORNE! +60';
+      this.racerBannerTimer = 1.2;
       this.sound.playPickup();
       this.onSessionChange?.(this.activeApp, this.score);
+    } else if (this.mode === 'cosmic-blaster') {
+      this.triggerBlasterJumpShockwave();
     }
+  }
+
+  private triggerBlasterJumpShockwave(): void {
+    const cam = xb.core.camera;
+    if (cam) {
+      cam.getWorldPosition(this._camPosScratch);
+    } else {
+      this._camPosScratch.set(0, 1.5, 0);
+    }
+    this.shockwaveRing.position.set(this._camPosScratch.x, 0.35, this._camPosScratch.z);
+    this.shockwaveRing.scale.setScalar(0.35);
+    this.shockwaveRing.visible = true;
+    this.shockwaveTimer = 0.65;
+
+    let slammed = 0;
+    for (let i = 0; i < this.targetPool.length && slammed < 2; i++) {
+      const target = this.targetPool[i];
+      if (!target.active) continue;
+      if (target.lod.position.distanceTo(this._camPosScratch) <= 4.6) {
+        target.active = false;
+        target.lod.visible = false;
+        this.activeTargetCount = Math.max(0, this.activeTargetCount - 1);
+        this.score += 120;
+        slammed += 1;
+      }
+    }
+    if (slammed > 0) {
+      if (this.score > this.highScore) this.highScore = this.score;
+      this.sound.playExplosion();
+      this.onSessionChange?.(this.activeApp, this.score);
+      this.blasterBannerText = `JUMP SHOCKWAVE x${slammed}! +${slammed * 120}`;
+    } else {
+      this.score += 35;
+      if (this.score > this.highScore) this.highScore = this.score;
+      this.sound.playPickup();
+      this.onSessionChange?.(this.activeApp, this.score);
+      this.blasterBannerText = 'JUMP SHOCKWAVE! +35';
+    }
+    this.blasterBannerTimer = 1.4;
   }
 
   getScore(): number {
@@ -446,6 +595,16 @@ export class VRGameTheater extends xb.Script {
       this.boltPool[i].active = false;
       this.boltPool[i].mesh.visible = false;
     }
+
+    for (let i = 0; i < this.hazardPool.length; i++) {
+      this.hazardPool[i].active = false;
+      this.hazardPool[i].mesh.visible = false;
+    }
+
+    if (this.shockwaveRing) {
+      this.shockwaveRing.visible = false;
+    }
+    this.shockwaveTimer = 0;
 
     for (let i = 0; i < this.racerObstaclePool.length; i++) {
       this.racerObstaclePool[i].active = false;
@@ -585,6 +744,25 @@ export class VRGameTheater extends xb.Script {
 
   private updateCosmicBlaster(dt: number): void {
     const cam = xb.core.camera;
+    if (cam) {
+      cam.getWorldPosition(this._camPosScratch);
+    } else {
+      this._camPosScratch.set(0, 1.5, 0);
+    }
+
+    if (this.blasterBannerTimer > 0) {
+      this.blasterBannerTimer = Math.max(0, this.blasterBannerTimer - dt);
+    }
+
+    if (this.shockwaveTimer > 0) {
+      this.shockwaveTimer = Math.max(0, this.shockwaveTimer - dt);
+      const frac = 1 - this.shockwaveTimer / 0.65;
+      this.shockwaveRing.scale.setScalar(0.4 + frac * 7.5);
+      this.shockwaveMat.opacity = Math.max(0, (1 - frac) * 0.85);
+      if (this.shockwaveTimer <= 0) {
+        this.shockwaveRing.visible = false;
+      }
+    }
 
     for (let i = 0; i < this.targetPool.length; i++) {
       const target = this.targetPool[i];
@@ -599,6 +777,68 @@ export class VRGameTheater extends xb.Script {
       target.lod.rotation.y += dt * 1.8;
       target.lod.rotation.x += dt * 0.9;
       if (cam) target.lod.update(cam);
+    }
+
+    // Periodically fire slow dodgeable drone plasma orbs toward the player
+    this.hazardTimer -= dt;
+    if (this.hazardTimer <= 0 && this.activeTargetCount > 0) {
+      this.hazardTimer = Math.max(1.35, 2.8 - this.wave * 0.15);
+      let shooter: SpaceTarget | null = null;
+      for (let i = 0; i < this.targetPool.length; i++) {
+        if (this.targetPool[i].active) {
+          shooter = this.targetPool[i];
+          if (Math.random() > 0.5) break;
+        }
+      }
+      if (shooter) {
+        for (let i = 0; i < this.hazardPool.length; i++) {
+          const h = this.hazardPool[i];
+          if (h.active) continue;
+          h.active = true;
+          h.life = 3.2;
+          h.mesh.position.copy(shooter.lod.position);
+          h.velocity
+            .copy(this._camPosScratch)
+            .sub(shooter.lod.position)
+            .normalize()
+            .multiplyScalar(2.4);
+          h.mesh.visible = true;
+          break;
+        }
+      }
+    }
+
+    for (let i = 0; i < this.hazardPool.length; i++) {
+      const h = this.hazardPool[i];
+      if (!h.active) continue;
+      h.mesh.position.addScaledVector(h.velocity, dt);
+      h.life -= dt;
+      const distSq = h.mesh.position.distanceToSquared(this._camPosScratch);
+      if (distSq < 0.22 * 0.22) {
+        if (this.liveCrouching || this.liveJumpHeightM > 0.14) {
+          this.score += 40;
+          if (this.score > this.highScore) this.highScore = this.score;
+          this.sound.playPickup();
+          this.blasterBannerText = this.liveCrouching ? 'CROUCH SHIELD +40' : 'JUMP DODGE +40';
+          this.blasterBannerTimer = 1.0;
+        } else {
+          this.score = Math.max(0, this.score - 35);
+          this.sound.playHoverTick();
+          this.blasterBannerText = 'MOVE / DUCK / JUMP TO DODGE!';
+          this.blasterBannerTimer = 1.1;
+        }
+        this.onSessionChange?.(this.activeApp, this.score);
+        h.active = false;
+        h.mesh.visible = false;
+      } else if (h.life <= 0) {
+        if (this.liveLocoState === 'walk' || this.liveLocoState === 'run') {
+          this.score += 20;
+          if (this.score > this.highScore) this.highScore = this.score;
+          this.onSessionChange?.(this.activeApp, this.score);
+        }
+        h.active = false;
+        h.mesh.visible = false;
+      }
     }
 
     for (let i = 0; i < this.boltPool.length; i++) {
@@ -643,22 +883,55 @@ export class VRGameTheater extends xb.Script {
 
   private updateNeonRacer(dt: number): void {
     const head = this.sensors.getHeadAngles();
-    const steerInput = THREE.MathUtils.clamp(-head.yaw * 1.4 - head.roll * 1.2, -1, 1);
+    const locoXZ = this.sensors.getLocomotionOffsetXZ();
+    const steerInput = THREE.MathUtils.clamp(
+      -head.yaw * 1.4 - head.roll * 1.2 + THREE.MathUtils.clamp(-locoXZ.x * 0.25, -0.35, 0.35),
+      -1,
+      1
+    );
     this.racerX = THREE.MathUtils.lerp(this.racerX, steerInput, Math.min(1, dt * 8));
 
-    this.racerSpeed = Math.min(1.5, this.racerSpeed + dt * 0.015);
+    // Back-camera Walk / Run / Back-Walk throttle + idle floor
+    const targetCruise =
+      this.liveLocoState === 'run'
+        ? 1.52
+        : this.liveLocoState === 'walk'
+          ? this.liveMoveDirection === 'backward'
+            ? 0.52
+            : 1.06
+          : 0.72;
+    this.racerSpeed = THREE.MathUtils.lerp(this.racerSpeed, targetCruise, Math.min(1, dt * 1.6));
+
+    // Airborne jump physics inside Neon Racer
+    if (this.racerAirborne) {
+      this.racerJumpY += this.racerJumpVelY * dt;
+      this.racerJumpVelY -= 11.4 * dt;
+      if (this.racerJumpY <= 0) {
+        this.racerJumpY = 0;
+        this.racerJumpVelY = 0;
+        this.racerAirborne = false;
+      }
+    }
+    const effectiveJumpY = Math.max(this.racerJumpY, this.liveJumpHeightM);
+
+    if (this.racerBannerTimer > 0) {
+      this.racerBannerTimer = Math.max(0, this.racerBannerTimer - dt);
+    }
+
     this.racerRoadScroll = (this.racerRoadScroll + dt * this.racerSpeed * 2.4) % 1;
     if (this.racerFlash > 0) this.racerFlash = Math.max(0, this.racerFlash - dt * 3);
 
     this.racerSpawnTimer += dt;
-    if (this.racerSpawnTimer >= 0.65 / this.racerSpeed) {
+    if (this.racerSpawnTimer >= 0.72 / Math.max(0.45, this.racerSpeed)) {
       this.racerSpawnTimer = 0;
       for (let i = 0; i < this.racerObstaclePool.length; i++) {
         const slot = this.racerObstaclePool[i];
         if (!slot.active) {
           slot.lane = (Math.floor(Math.random() * 3) - 1) * 0.62;
           slot.z = 0.02;
-          slot.isOrb = Math.random() > 0.42;
+          const r = Math.random();
+          slot.isOrb = r > 0.48;
+          slot.isHighGate = !slot.isOrb && r < 0.22;
           slot.active = true;
           break;
         }
@@ -674,9 +947,21 @@ export class VRGameTheater extends xb.Script {
           if (obs.isOrb) {
             this.score += 50;
             this.sound.playPickup();
+          } else if (obs.isHighGate && this.liveCrouching) {
+            this.score += 70;
+            this.racerBannerText = 'DUCK CLEAR! +70';
+            this.racerBannerTimer = 1.1;
+            this.sound.playPickup();
+          } else if (!obs.isHighGate && effectiveJumpY > 0.18) {
+            this.score += 80;
+            this.racerBannerText = 'JUMP CLEAR! +80';
+            this.racerBannerTimer = 1.1;
+            this.sound.playPickup();
           } else {
             this.score = Math.max(0, this.score - 75);
             this.racerFlash = 1;
+            this.racerBannerText = obs.isHighGate ? 'CROUCH OR STEER!' : 'JUMP OR STEER!';
+            this.racerBannerTimer = 1.1;
             this.sound.playExplosion();
           }
           if (this.score > this.highScore) this.highScore = this.score;
@@ -1124,12 +1409,21 @@ export class VRGameTheater extends xb.Script {
     ctx.stroke();
 
     const head = this.sensors.getHeadAngles();
+    const locoXZ = this.sensors.getLocomotionOffsetXZ();
+    const px = cx + THREE.MathUtils.clamp((locoXZ.x / 6.5) * (r * 0.72), -r * 0.75, r * 0.75);
+    const py = cy + THREE.MathUtils.clamp((locoXZ.z / 6.5) * (r * 0.72), -r * 0.75, r * 0.75);
     const lookAngle = -head.yaw;
     ctx.fillStyle = 'rgba(56, 189, 248, 0.18)';
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, r, lookAngle - Math.PI / 2 - 0.35, lookAngle - Math.PI / 2 + 0.35);
+    ctx.moveTo(px, py);
+    ctx.arc(px, py, r * 0.75, lookAngle - Math.PI / 2 - 0.35, lookAngle - Math.PI / 2 + 0.35);
     ctx.closePath();
+    ctx.fill();
+
+    // Live player XZ arena marker
+    ctx.fillStyle = this.liveCrouching ? '#a78bfa' : '#34d399';
+    ctx.beginPath();
+    ctx.arc(px, py, 7, 0, Math.PI * 2);
     ctx.fill();
 
     for (let i = 0; i < this.targetPool.length; i++) {
@@ -1141,6 +1435,17 @@ export class VRGameTheater extends xb.Script {
       ctx.fillStyle = '#f43f5e';
       ctx.beginPath();
       ctx.arc(bx, by, 9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (let i = 0; i < this.hazardPool.length; i++) {
+      const h = this.hazardPool[i];
+      if (!h.active) continue;
+      const hx = cx + THREE.MathUtils.clamp((h.mesh.position.x / 5) * r, -r, r);
+      const hy = cy + THREE.MathUtils.clamp((h.mesh.position.z / 5) * r, -r, r);
+      ctx.fillStyle = '#fbbf24';
+      ctx.beginPath();
+      ctx.arc(hx, hy, 5, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -1156,6 +1461,29 @@ export class VRGameTheater extends xb.Script {
     ctx.font = '24px sans-serif';
     ctx.fillText(`WAVE ${this.wave}  •  DRONES LEFT: ${this.activeTargetCount}`, 48, 160);
 
+    const locoLabel =
+      this.liveLocoState === 'jump'
+        ? 'JUMP SHOCKWAVE!'
+        : this.liveLocoState === 'run'
+          ? 'OVERDRIVE RUN x2'
+          : this.liveCrouching
+            ? 'CROUCH SHIELD ON'
+            : this.liveLocoState === 'walk'
+              ? this.liveMoveDirection === 'backward'
+                ? 'WALKING BACK'
+                : 'WALKING ARENA'
+              : 'BACK-CAM READY';
+    ctx.fillStyle = this.liveLocoState === 'idle' ? '#94a3b8' : '#34d399';
+    ctx.font = 'bold 21px sans-serif';
+    ctx.fillText(`MOTION: ${locoLabel}`, 48, 200);
+
+    if (this.blasterBannerTimer > 0 && this.blasterBannerText) {
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 26px sans-serif';
+      ctx.fillText(this.blasterBannerText, cx, 78);
+    }
+
     ctx.textAlign = 'right';
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 26px sans-serif';
@@ -1163,9 +1491,9 @@ export class VRGameTheater extends xb.Script {
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#cbd5e1';
-    ctx.font = '21px sans-serif';
+    ctx.font = '20px sans-serif';
     ctx.fillText(
-      'LOOK 360° TO LOCK-ON  •  NOD / TAP HEADSET TO FIRE  •  SHAKE HEAD TO EXIT',
+      'LOOK TO AUTO-FIRE  •  WALK/RUN/DODGE  •  JUMP = SHOCKWAVE  •  CROUCH = SHIELD',
       cx,
       H - 30
     );
@@ -1232,17 +1560,50 @@ export class VRGameTheater extends xb.Script {
         ctx.beginPath();
         ctx.arc(x, y - size * 0.4, size * 0.55, 0, Math.PI * 2);
         ctx.fill();
+      } else if (obs.isHighGate) {
+        // Overhead laser gate (duck/crouch under!)
+        ctx.fillStyle = '#fbbf24';
+        ctx.fillRect(x - size * 0.85, y - size * 1.45, size * 1.7, size * 0.45);
+        ctx.fillStyle = 'rgba(251, 191, 36, 0.45)';
+        ctx.fillRect(x - size * 0.85, y - size * 1.0, 5, size);
+        ctx.fillRect(x + size * 0.85 - 5, y - size * 1.0, 5, size);
       } else {
+        // Ground red barrier (jump over or steer!)
         ctx.fillStyle = '#f43f5e';
         ctx.fillRect(x - size * 0.7, y - size * 0.7, size * 1.4, size * 0.7);
       }
     }
 
     const px = W / 2 + this.racerX * (bottomW * 0.42);
-    const py = H - 56;
-    ctx.fillStyle = '#22d3ee';
+    const groundY = H - 56;
+    const jumpPx = Math.max(this.racerJumpY, this.liveJumpHeightM) * 95;
+    const py = groundY - jumpPx + (this.liveCrouching ? 14 : 0);
+
+    // Craft shadow when airborne
+    if (jumpPx > 4) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      ctx.beginPath();
+      ctx.ellipse(px, groundY + 14, 34, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Turbo flames when running
+    if (this.liveLocoState === 'run') {
+      ctx.fillStyle = '#f97316';
+      ctx.beginPath();
+      ctx.moveTo(px - 18, py + 16);
+      ctx.lineTo(px - 10, py + 38);
+      ctx.lineTo(px - 2, py + 16);
+      ctx.moveTo(px + 2, py + 16);
+      ctx.lineTo(px + 10, py + 38);
+      ctx.lineTo(px + 18, py + 16);
+      ctx.fill();
+    }
+
+    const craftH = this.liveCrouching ? 18 : 34;
+    ctx.fillStyle = this.liveCrouching ? '#a78bfa' : jumpPx > 10 ? '#34d399' : '#22d3ee';
     ctx.beginPath();
-    ctx.moveTo(px, py - 34);
+    ctx.moveTo(px, py - craftH);
     ctx.lineTo(px + 42, py + 16);
     ctx.lineTo(px - 42, py + 16);
     ctx.closePath();
@@ -1261,10 +1622,12 @@ export class VRGameTheater extends xb.Script {
     ctx.fillStyle = '#f472b6';
     ctx.fillText(`SPEED ${Math.round(this.racerSpeed * 220)} KM/H`, W - 42, 56);
     ctx.textAlign = 'center';
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '19px sans-serif';
+    ctx.fillStyle = this.racerBannerTimer > 0 ? '#fbbf24' : '#e2e8f0';
+    ctx.font = this.racerBannerTimer > 0 ? 'bold 26px sans-serif' : '19px sans-serif';
     ctx.fillText(
-      'TILT/TURN HEAD TO STEER  •  NOD = NITRO BOOST  •  SHAKE HEAD = EXIT',
+      this.racerBannerTimer > 0
+        ? this.racerBannerText
+        : 'BACK-CAM: TURN=STEER • WALK/RUN=SPEED • JUMP OVER RED • CROUCH UNDER GOLD',
       W / 2,
       46
     );
@@ -1326,5 +1689,9 @@ export class VRGameTheater extends xb.Script {
     this.targetMat.dispose();
     this.targetLowMat.dispose();
     this.targetRingMat.dispose();
+    this.hazardGeo.dispose();
+    this.hazardMat.dispose();
+    this.shockwaveGeo.dispose();
+    this.shockwaveMat.dispose();
   }
 }

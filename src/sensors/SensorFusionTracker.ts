@@ -170,6 +170,8 @@ export class SensorFusionTracker extends xb.Script {
   private cameraVideo: HTMLVideoElement | null = null;
   private cameraConsumers = new Set<string>();
   private cameraFlowEnabled = false;
+  private cameraAutoStartPromise: Promise<boolean> | null = null;
+  private userDisabledCameraFlow = false;
   private switchedToCameraFlowByToggle = false;
   private modeBeforeCameraFlow: SensorTrackingMode = 'auto';
   private flowCanvas: HTMLCanvasElement | null = null;
@@ -304,27 +306,63 @@ export class SensorFusionTracker extends xb.Script {
     this.isDraggingLook = false;
   };
 
+  private readonly handleFirstInteractionCam = () => {
+    void this.ensureCameraFlowStarted();
+  };
+
   init(): void {
     this.attachPassiveListeners();
     this.tryStartGenericSensors();
-    if (
-      typeof navigator !== 'undefined' &&
-      typeof navigator.permissions?.query === 'function' &&
-      typeof navigator.mediaDevices?.getUserMedia === 'function'
-    ) {
-      void navigator.permissions
-        .query({name: 'camera' as PermissionName})
-        .then((status) => {
-          if (status.state === 'granted' && !this.cameraStream) {
-            void this.acquireSharedCamera('optical-flow').then((video) => {
-              if (video) {
-                this.cameraFlowEnabled = true;
-              }
-            });
-          }
-        })
-        .catch(() => {});
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pointerdown', this.handleFirstInteractionCam, {passive: true});
+      window.addEventListener('touchstart', this.handleFirstInteractionCam, {passive: true});
     }
+    void this.ensureCameraFlowStarted();
+  }
+
+  private removeFirstInteractionCamListeners(): void {
+    if (typeof window === 'undefined') return;
+    window.removeEventListener('pointerdown', this.handleFirstInteractionCam);
+    window.removeEventListener('touchstart', this.handleFirstInteractionCam);
+  }
+
+  async ensureCameraFlowStarted(force = false): Promise<boolean> {
+    if (!force && this.userDisabledCameraFlow) return false;
+    if (this.cameraFlowEnabled && this.cameraVideo) {
+      this.removeFirstInteractionCamListeners();
+      return true;
+    }
+    if (this.cameraAutoStartPromise) {
+      return this.cameraAutoStartPromise;
+    }
+    if (typeof navigator === 'undefined' || typeof navigator.mediaDevices?.getUserMedia !== 'function') {
+      return false;
+    }
+
+    this.cameraAutoStartPromise = (async () => {
+      try {
+        if (!force && typeof navigator.permissions?.query === 'function') {
+          try {
+            const status = await navigator.permissions.query({name: 'camera' as PermissionName});
+            if (status.state === 'denied') {
+              return false;
+            }
+          } catch {
+            // Permissions API may not support 'camera' on some WebViews; proceed directly
+          }
+        }
+        const video = await this.acquireSharedCamera('optical-flow');
+        if (!video) return false;
+        this.cameraFlowEnabled = true;
+        this.autoFlowEnabled = true;
+        this.removeFirstInteractionCamListeners();
+        return true;
+      } finally {
+        this.cameraAutoStartPromise = null;
+      }
+    })();
+
+    return this.cameraAutoStartPromise;
   }
 
   private attachPassiveListeners(): void {
@@ -1072,15 +1110,18 @@ export class SensorFusionTracker extends xb.Script {
 
   async toggleCameraOpticalFlow(): Promise<boolean> {
     if (this.cameraFlowEnabled) {
+      this.userDisabledCameraFlow = true;
       this.stopCameraOpticalFlow();
       return false;
     }
 
+    this.userDisabledCameraFlow = false;
     const video = await this.acquireSharedCamera('optical-flow');
     if (!video) return false;
 
     this.ensureAutoOpticalFlow();
     this.cameraFlowEnabled = true;
+    this.removeFirstInteractionCamListeners();
     this.hasPrevLuma = false;
     this.visVertLp = 0;
     this.visVySmooth = 0;
@@ -1125,6 +1166,10 @@ export class SensorFusionTracker extends xb.Script {
 
   isCameraFlowEnabled(): boolean {
     return this.cameraFlowEnabled;
+  }
+
+  getLocomotionOffsetXZ(): THREE.Vector3 {
+    return this._locoOffsetXZ;
   }
 
   private medianTextured(values: Float32Array, contrast: Float32Array, minContrast = 4): number {
@@ -2171,8 +2216,11 @@ export class SensorFusionTracker extends xb.Script {
     headsetTap: boolean;
     accelMag: number;
     stepEvent: 'none' | 'walk' | 'run';
+    locoState: 'idle' | 'walk' | 'run' | 'jump' | 'crouch';
     moveDirection: 'forward' | 'backward';
     crouching: boolean;
+    speedMps: number;
+    jumpHeightM: number;
     jumped: boolean;
     landed: boolean;
   } {
@@ -2196,14 +2244,18 @@ export class SensorFusionTracker extends xb.Script {
       headsetTap,
       accelMag: this.latestLinearAccelMag,
       stepEvent,
+      locoState: this.locomotionState,
       moveDirection: this.visMoveSign < 0 ? 'backward' : 'forward',
       crouching: Math.abs(this.crouchOffsetY) > 0.08 || this.crouchTargetY < -0.05,
+      speedMps: this.locoSpeed,
+      jumpHeightM: this.jumpHeightY,
       jumped,
       landed,
     };
   }
 
   dispose(): void {
+    this.removeFirstInteractionCamListeners();
     this.stopGenericSensors();
     this.stopCameraOpticalFlow();
     if (this.wakeLockSentinel) {
