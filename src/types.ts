@@ -85,11 +85,13 @@ export interface HardwareAvailability {
   touchDrag: boolean; // Keyboard / Touch fallback
 }
 
-export type LocomotionState = 'idle' | 'walk' | 'run' | 'jump';
+export type LocomotionState = 'idle' | 'walk' | 'run' | 'jump' | 'crouch';
 
 export interface LocomotionTelemetry {
   enabled: boolean;
   state: LocomotionState;
+  moveDirection: 'forward' | 'backward' | 'none';
+  crouching: boolean;
   stepCount: number;
   cadenceSpm: number;
   speedMps: number;

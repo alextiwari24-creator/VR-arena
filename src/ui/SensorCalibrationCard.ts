@@ -92,7 +92,7 @@ export class SensorCalibrationCard extends xb.UICard {
       style: {flexGrow: 1},
     });
     const camFlowBtn = new xb.UIButton({
-      label: 'Back-Cam Head: OFF',
+      label: 'Back-Cam Move: OFF',
       icon: 'videocam',
       style: {flexGrow: 1},
     });
@@ -367,7 +367,7 @@ export class SensorCalibrationCard extends xb.UICard {
       this.camFlowBtn.label = 'Starting Cam...';
       void this.sensors.toggleCameraOpticalFlow().then((active) => {
         this.camFlowBtn.disabled = false;
-        this.camFlowBtn.label = active ? 'Back-Cam Head: ON' : 'Back-Cam Head: OFF';
+        this.camFlowBtn.label = active ? 'Back-Cam Move: ON' : 'Back-Cam Move: OFF';
         this.refreshTelemetry();
       });
     };
@@ -556,23 +556,29 @@ export class SensorCalibrationCard extends xb.UICard {
         ? `JUMP (${loco.jumpHeightM.toFixed(2)}m)`
         : loco.state === 'run'
           ? `RUN (${loco.cadenceSpm} SPM)`
-          : loco.state === 'walk'
-            ? `WALK (${loco.cadenceSpm} SPM)`
-            : 'IDLE';
+          : loco.state === 'crouch'
+            ? 'CROUCH'
+            : loco.state === 'walk'
+              ? loco.moveDirection === 'backward'
+                ? `BACK WALK (${loco.cadenceSpm} SPM)`
+                : `WALK (${loco.cadenceSpm} SPM)`
+              : 'IDLE';
     this.locoText.text = `Motion: ${locoBadge} • ${loco.stepCount} steps • ${loco.speedMps} m/s`;
     this.locoText.style.color =
       loco.state === 'jump'
         ? '#fbbf24'
         : loco.state === 'run'
           ? '#f472b6'
-          : loco.state === 'walk'
-            ? '#34d399'
-            : '#94a3b8';
+          : loco.state === 'crouch'
+            ? '#38bdf8'
+            : loco.state === 'walk'
+              ? '#34d399'
+              : '#94a3b8';
 
     if (!this.camFlowBtn.disabled) {
       const expectedCamFlow = this.sensors.isCameraFlowEnabled()
-        ? 'Back-Cam Head: ON'
-        : 'Back-Cam Head: OFF';
+        ? 'Back-Cam Move: ON'
+        : 'Back-Cam Move: OFF';
       if (this.camFlowBtn.label !== expectedCamFlow) {
         this.camFlowBtn.label = expectedCamFlow;
       }
@@ -616,25 +622,25 @@ export class SensorCalibrationCard extends xb.UICard {
       this.gestureText.text = `Hands: ${handSrc} • Gesture: ${gestLabel} • Head: ${headLabel}`;
       if (tel.mode === 'camera-flow') {
         this.fallbackHintText.text = hw.cameraFlow
-          ? 'Back Camera tracks Left/Right/Up/Down head turns + Walk, Run & Jump!'
-          : 'Allow camera permission to track head turns + Walk/Run/Jump.';
+          ? 'Back Camera tracks Turn, Walk Fwd/Back, Run, Jump & Crouch!'
+          : 'Allow camera permission to track head turns, Walk, Run, Jump & Crouch.';
       } else {
         this.fallbackHintText.text = g.lastActionLabel;
       }
     } else if (tel.mode === 'camera-flow') {
       this.fallbackHintText.text = hw.cameraFlow
-        ? 'Back Camera tracks Left/Right/Up/Down head turns + Walk, Run & Jump!'
-        : 'Allow camera permission to track head turns + Walk/Run/Jump.';
+        ? 'Back Camera tracks Turn, Walk Fwd/Back, Run, Jump & Crouch!'
+        : 'Allow camera permission to track head turns, Walk, Run, Jump & Crouch.';
     } else if (hw.gyro && hw.compass && hw.accel) {
       this.fallbackHintText.text = tel.gyroCalibrated
         ? 'Full 9-axis hardware fusion + drift bias calibration active.'
         : 'Full 9-axis hardware fusion active.';
     } else if (hw.accel && !hw.compass && !hw.gyro && !hw.cameraFlow) {
       this.fallbackHintText.text =
-        'No Gyro/Compass detected: Accel tracks tilt; tap Back-Cam Head: ON for 360° yaw!';
+        'No Gyro/Compass detected: Accel tracks tilt; tap Back-Cam Move: ON for 360° & locomotion!';
     } else if (hw.cameraFlow) {
       this.fallbackHintText.text =
-        '2-Level Pyramid Back-Cam tracking pan/tilt + Walk/Run/Jump.';
+        '2-Level Pyramid Back-Cam tracking Turn, Walk Fwd/Back, Run, Jump & Crouch.';
     } else {
       this.fallbackHintText.text = `Active fallback pipeline: ${tel.activeSourcesLabel}`;
     }

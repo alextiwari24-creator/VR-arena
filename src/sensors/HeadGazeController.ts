@@ -409,17 +409,13 @@ export class HeadGazeController extends xb.Script {
     const cam = xb.core.camera as THREE.PerspectiveCamera | undefined;
     if (!cam) return;
 
-    this.reticleGroup.visible = this.enabled;
-    if (!this.enabled) return;
-
     const dt = Math.min(xb.getDeltaTime(), 0.05);
     const now = performance.now();
     this.pollGamepadInputs(dt);
 
     const motion = this.sensors.consumeHeadMotionSignals();
-    const mode = this.callbacks.getGameMode();
 
-    // Handle Walk / Run / Jump physical sensor events even if reticle doesn't hit UI
+    // Handle Walk / Run / Jump / Crouch physical sensor & back-camera events regardless of gaze toggle
     if (motion.jumped) {
       this.sound.playJump();
       this.callbacks.onJump?.();
@@ -430,8 +426,20 @@ export class HeadGazeController extends xb.Script {
       const running = motion.stepEvent === 'run';
       this.sound.playFootstep(running);
       this.callbacks.onStep?.(running);
-      this.setStatusBanner(running ? 'Sensed: RUNNING!' : 'Sensed: WALKING');
+      const label = running
+        ? 'Sensed: RUNNING!'
+        : motion.moveDirection === 'backward'
+          ? 'Sensed: WALKING BACK'
+          : 'Sensed: WALKING';
+      this.setStatusBanner(label);
+    } else if (motion.crouching) {
+      this.setStatusBanner('Sensed: CROUCHING');
     }
+
+    this.reticleGroup.visible = this.enabled;
+    if (!this.enabled) return;
+
+    const mode = this.callbacks.getGameMode();
 
     cam.updateMatrixWorld();
     cam.getWorldPosition(this._camPos);

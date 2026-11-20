@@ -477,7 +477,7 @@ export class VRStoreHubApp extends xb.Script {
     });
 
     this.camHeadHudBtn = new xb.UIButton({
-      label: 'Back-Cam Head: OFF',
+      label: 'Back-Cam Move: OFF',
       icon: 'videocam',
       onClick: () => {
         this.sound.playClick();
@@ -485,7 +485,7 @@ export class VRStoreHubApp extends xb.Script {
         this.camHeadHudBtn.label = 'Starting Cam...';
         void this.sensors.toggleCameraOpticalFlow().then((active) => {
           this.camHeadHudBtn.disabled = false;
-          this.camHeadHudBtn.label = active ? 'Back-Cam Head: ON' : 'Back-Cam Head: OFF';
+          this.camHeadHudBtn.label = active ? 'Back-Cam Move: ON' : 'Back-Cam Move: OFF';
         });
       },
     });
@@ -720,8 +720,8 @@ export class VRStoreHubApp extends xb.Script {
     const gTel = this.gestures.getTelemetry();
     if (!this.camHeadHudBtn.disabled) {
       const targetCamHeadLabel = this.sensors.isCameraFlowEnabled()
-        ? 'Back-Cam Head: ON'
-        : 'Back-Cam Head: OFF';
+        ? 'Back-Cam Move: ON'
+        : 'Back-Cam Move: OFF';
       if (this.camHeadHudBtn.label !== targetCamHeadLabel) {
         this.camHeadHudBtn.label = targetCamHeadLabel;
       }
@@ -756,11 +756,23 @@ export class VRStoreHubApp extends xb.Script {
       this.activeSessionAppName
     );
 
+    const loco = tel.locomotion;
     if (gazeTel.enabled && gazeTel.hoveredLabel) {
       this.hudGestureText.text =
         dwellPct > 5
           ? `Gaze ${dwellPct}%: ${gazeTel.hoveredLabel}`
           : `Gazing: ${gazeTel.hoveredLabel}`;
+    } else if (loco.state !== 'idle') {
+      this.hudGestureText.text =
+        loco.state === 'jump'
+          ? `JUMP (${loco.jumpHeightM.toFixed(1)}m)`
+          : loco.state === 'run'
+            ? `RUNNING • ${loco.cadenceSpm} SPM`
+            : loco.state === 'crouch'
+              ? 'CROUCHING'
+              : loco.moveDirection === 'backward'
+                ? `BACK WALK • ${loco.cadenceSpm} SPM`
+                : `WALKING • ${loco.cadenceSpm} SPM`;
     } else if (gTel.activeGesture !== 'none' || gTel.cameraHandsActive) {
       this.hudGestureText.text = gTel.lastActionLabel;
     } else if (gazeTel.enabled) {

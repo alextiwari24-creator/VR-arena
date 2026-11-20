@@ -80,9 +80,9 @@ export class SensorFusionTracker extends xb.Script {
   private readonly _baseCamPos = new THREE.Vector3();
   private hasBaseCamPos = false;
 
-  // Walk / Run / Jump real-time IMU locomotion engine
+  // Walk / Run / Jump / Crouch real-time IMU + Optical-Flow locomotion engine
   private locomotionEnabled = true;
-  private locomotionState: 'idle' | 'walk' | 'run' | 'jump' = 'idle';
+  private locomotionState: 'idle' | 'walk' | 'run' | 'jump' | 'crouch' = 'idle';
   private readonly _gravLp = new THREE.Vector3(0, 9.81, 0);
   private hasGravLp = false;
   private readonly _locoOffsetXZ = new THREE.Vector3();
@@ -98,6 +98,7 @@ export class SensorFusionTracker extends xb.Script {
   private stepPeakArmed = false;
   private stepPeakMax = 0;
   private lastStepAt = 0;
+  private lastImuStepAt = 0;
   private stepCount = 0;
   private stepTimestamps: number[] = [];
   private cadenceSpm = 0;
@@ -183,17 +184,27 @@ export class SensorFusionTracker extends xb.Script {
   private readonly coarsePrev = new Uint8Array(48 * 36);
   private readonly patchDx = new Float32Array(9);
   private readonly patchDy = new Float32Array(9);
+  private readonly patchContrast = new Float32Array(9);
   private readonly sortScratch = new Float32Array(9);
   private hasPrevLuma = false;
   private flowSampleAccum = 0;
   private visVertLp = 0;
   private visVySmooth = 0;
+  private visRawVy1 = 0;
+  private visRawVy2 = 0;
   private visPeakPos = 0;
   private visPeakNeg = 0;
+  private visJumpPrimeFrames = 0;
   private visJumpPrimedUntil = 0;
   private visDivergenceLp = 0;
   private visForwardHoldFrames = 0;
+  private visBackwardHoldFrames = 0;
   private visCoherentForward = false;
+  private visCoherentBackward = false;
+  private visMoveSign: 1 | -1 = 1;
+  private crouchOffsetY = 0;
+  private crouchTargetY = 0;
+  private crouchUntil = 0;
 
   // Screen wake lock
   private wakeLockSentinel: {release: () => Promise<void>} | null = null;
@@ -296,6 +307,24 @@ export class SensorFusionTracker extends xb.Script {
   init(): void {
     this.attachPassiveListeners();
     this.tryStartGenericSensors();
+    if (
+      typeof navigator !== 'undefined' &&
+      typeof navigator.permissions?.query === 'function' &&
+      typeof navigator.mediaDevices?.getUserMedia === 'function'
+    ) {
+      void navigator.permissions
+        .query({name: 'camera' as PermissionName})
+        .then((status) => {
+          if (status.state === 'granted' && !this.cameraStream) {
+            void this.acquireSharedCamera('optical-flow').then((video) => {
+              if (video) {
+                this.cameraFlowEnabled = true;
+              }
+            });
+          }
+        })
+        .catch(() => {});
+    }
   }
 
   private attachPassiveListeners(): void {
@@ -759,6 +788,7 @@ export class SensorFusionTracker extends xb.Script {
       ((this.freeFallMs >= 65 && now - this.lastStepAt > 120) ||
         (now <= this.pushOffPrimedUntil && rawVert < -2.1))
     ) {
+      this.lastImuStepAt = now;
       this.triggerJump();
       this.freeFallMs = 0;
       this.pushOffPrimedUntil = 0;
@@ -783,6 +813,8 @@ export class SensorFusionTracker extends xb.Script {
         this.stepPeakMax = absVert;
       }
       if (absVert < 0.85) {
+        this.lastImuStepAt = now;
+        this.visMoveSign = 1;
         this.registerStep(now, this.stepPeakMax);
         this.stepPeakArmed = false;
         this.stepPeakMax = 0;
@@ -1052,11 +1084,21 @@ export class SensorFusionTracker extends xb.Script {
     this.hasPrevLuma = false;
     this.visVertLp = 0;
     this.visVySmooth = 0;
+    this.visRawVy1 = 0;
+    this.visRawVy2 = 0;
     this.visPeakPos = 0;
     this.visPeakNeg = 0;
     this.visDivergenceLp = 0;
     this.visForwardHoldFrames = 0;
+    this.visBackwardHoldFrames = 0;
     this.visCoherentForward = false;
+    this.visCoherentBackward = false;
+    this.visMoveSign = 1;
+    this.crouchOffsetY = 0;
+    this.crouchTargetY = 0;
+    this.crouchUntil = 0;
+    this.patchContrast.fill(0);
+    this.visJumpPrimeFrames = 0;
     this.visJumpPrimedUntil = 0;
     if (this.mode !== 'camera-flow') {
       this.modeBeforeCameraFlow = this.mode;
@@ -1085,11 +1127,21 @@ export class SensorFusionTracker extends xb.Script {
     return this.cameraFlowEnabled;
   }
 
-  private median9(values: Float32Array): number {
+  private medianTextured(values: Float32Array, contrast: Float32Array, minContrast = 4): number {
+    let count = 0;
     for (let i = 0; i < 9; i++) {
-      this.sortScratch[i] = values[i];
+      if (contrast[i] > minContrast) {
+        this.sortScratch[count] = values[i];
+        count += 1;
+      }
     }
-    for (let i = 1; i < 9; i++) {
+    if (count === 0) {
+      for (let i = 0; i < 9; i++) {
+        this.sortScratch[i] = values[i];
+      }
+      count = 9;
+    }
+    for (let i = 1; i < count; i++) {
       const key = this.sortScratch[i];
       let j = i - 1;
       while (j >= 0 && this.sortScratch[j] > key) {
@@ -1098,7 +1150,7 @@ export class SensorFusionTracker extends xb.Script {
       }
       this.sortScratch[j + 1] = key;
     }
-    return this.sortScratch[4];
+    return this.sortScratch[count >> 1];
   }
 
   private computeSadBlock(
@@ -1187,13 +1239,14 @@ export class SensorFusionTracker extends xb.Script {
           const fx0 = 16 + px * 22;
           const fx1 = fx0 + 18;
 
-          // Level 1: Coarse search (±5px @ 48x36 = ±10px full-res)
+          // Level 1: Coarse search (±5px @ 48x36 = ±10px full-res) with tiny shift regularization
+          // to prevent blank-patch saturation or repetitive tile/blind aliasing.
           let bestCDx = 0;
           let bestCDy = 0;
           let bestCSad = Number.POSITIVE_INFINITY;
           for (let cdy = -coarseR; cdy <= coarseR; cdy++) {
             for (let cdx = -coarseR; cdx <= coarseR; cdx++) {
-              const sad = this.computeSadBlock(
+              const rawSad = this.computeSadBlock(
                 this.coarsePrev,
                 this.coarseCurr,
                 cw,
@@ -1203,10 +1256,11 @@ export class SensorFusionTracker extends xb.Script {
                 cy1,
                 cdx,
                 cdy,
-                2
+                1
               );
-              if (sad < bestCSad) {
-                bestCSad = sad;
+              const cost = rawSad + ((cdx < 0 ? -cdx : cdx) + (cdy < 0 ? -cdy : cdy)) * 18;
+              if (cost < bestCSad) {
+                bestCSad = cost;
                 bestCDx = cdx;
                 bestCDy = cdy;
               }
@@ -1223,6 +1277,7 @@ export class SensorFusionTracker extends xb.Script {
 
           let bestDx = seedDx;
           let bestDy = seedDy;
+          let bestCost = Number.POSITIVE_INFINITY;
           let bestSad = Number.POSITIVE_INFINITY;
           for (let dy = minDy; dy <= maxDy; dy++) {
             for (let dx = minDx; dx <= maxDx; dx++) {
@@ -1238,7 +1293,9 @@ export class SensorFusionTracker extends xb.Script {
                 dy,
                 2
               );
-              if (sad < bestSad) {
+              const cost = sad + ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy)) * 2;
+              if (cost < bestCost) {
+                bestCost = cost;
                 bestSad = sad;
                 bestDx = dx;
                 bestDy = dy;
@@ -1312,12 +1369,30 @@ export class SensorFusionTracker extends xb.Script {
 
           this.patchDx[patchIdx] = subDx;
           this.patchDy[patchIdx] = subDy;
+
+          // Measure local texture gradient strength (zero-GC) to ignore featureless ceiling/floor
+          let contrastSum = 0;
+          let contrastSamples = 0;
+          for (let y = fy0; y < fy1 - 2; y += 2) {
+            const row = y * w;
+            const nextRow = (y + 2) * w;
+            for (let x = fx0; x < fx1 - 2; x += 2) {
+              const c = curr[row + x];
+              const gx = c - curr[row + x + 2];
+              const gy = c - curr[nextRow + x];
+              contrastSum += (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+              contrastSamples += 1;
+            }
+          }
+          this.patchContrast[patchIdx] =
+            contrastSamples > 0 ? contrastSum / contrastSamples : 0;
+
           patchIdx += 1;
         }
       }
 
-      const medianDx = this.median9(this.patchDx);
-      const medianDy = this.median9(this.patchDy);
+      const medianDx = this.medianTextured(this.patchDx, this.patchContrast);
+      const medianDy = this.medianTextured(this.patchDy, this.patchContrast);
 
       this.lastSeen.cameraFlow = now;
       this.sampleCount += 1;
@@ -1361,29 +1436,73 @@ export class SensorFusionTracker extends xb.Script {
       const rollCurl = ((topRowDx - botRowDx) / 28 + (rightColDy - leftColDy) / 44) * 0.5;
       const dRoll = Math.abs(rollCurl) > 0.004 ? THREE.MathUtils.clamp(rollCurl * 0.72, -0.14, 0.14) : 0;
 
-      // Rotationally invariant 2D Radial Divergence (forward motion toward scene expands image)
-      const leftColDx = (this.patchDx[0] + this.patchDx[3] + this.patchDx[6]) / 3;
-      const rightColDx = (this.patchDx[2] + this.patchDx[5] + this.patchDx[8]) / 3;
-      const topRowDy = (this.patchDy[0] + this.patchDy[1] + this.patchDy[2]) / 3;
-      const botRowDy = (this.patchDy[6] + this.patchDy[7] + this.patchDy[8]) / 3;
-      const horizExp = rightColDx - leftColDx;
-      const vertExp = botRowDy - topRowDy;
-      const radialExp = (horizExp / 44 + vertExp / 28) * 0.5;
+      // Texture-weighted 2D Radial Divergence (strictly ignores blank ceilings/floors & edge outliers)
+      let leftDxSum = 0;
+      let leftW = 0;
+      let rightDxSum = 0;
+      let rightW = 0;
+      let topDySum = 0;
+      let topW = 0;
+      let botDySum = 0;
+      let botW = 0;
+      for (let r = 0; r < 3; r++) {
+        const li = r * 3;
+        const ri = r * 3 + 2;
+        if (this.patchContrast[li] > 6 && Math.abs(this.patchDx[li] - medianDx) < 3.8) {
+          leftDxSum += this.patchDx[li];
+          leftW += 1;
+        }
+        if (this.patchContrast[ri] > 6 && Math.abs(this.patchDx[ri] - medianDx) < 3.8) {
+          rightDxSum += this.patchDx[ri];
+          rightW += 1;
+        }
+
+        const ti = r;
+        const bi = 6 + r;
+        if (this.patchContrast[ti] > 6 && Math.abs(this.patchDy[ti] - medianDy) < 3.8) {
+          topDySum += this.patchDy[ti];
+          topW += 1;
+        }
+        if (this.patchContrast[bi] > 6 && Math.abs(this.patchDy[bi] - medianDy) < 3.8) {
+          botDySum += this.patchDy[bi];
+          botW += 1;
+        }
+      }
+      const hasHorizDiv = leftW > 0 && rightW > 0;
+      const hasVertDiv = topW > 0 && botW > 0;
+      const horizExp = hasHorizDiv ? rightDxSum / rightW - leftDxSum / leftW : 0;
+      const vertExp = hasVertDiv ? botDySum / botW - topDySum / topW : 0;
+      const divAxes = (hasHorizDiv ? 1 : 0) + (hasVertDiv ? 1 : 0);
+      const radialExp =
+        divAxes > 0
+          ? ((hasHorizDiv ? horizExp / 44 : 0) + (hasVertDiv ? vertExp / 28 : 0)) / divAxes
+          : 0;
       const divRate = radialExp / Math.max(dtSec, 0.016);
-      this.visDivergenceLp = THREE.MathUtils.lerp(this.visDivergenceLp, divRate, 0.25);
-      // Coherent expansion: both axes must genuinely expand outward over multiple frames while not rotating fast
-      if (
-        horizExp > 0.18 &&
-        vertExp > 0.12 &&
-        Math.abs(rotDx) < 1.5 &&
-        Math.abs(rotDy) < 1.5 &&
-        Math.abs(this.visVySmooth) < 35
-      ) {
+      this.visDivergenceLp = THREE.MathUtils.lerp(this.visDivergenceLp, divRate, 0.28);
+
+      const stableRotForDiv =
+        Math.abs(rotDx) < 1.8 && Math.abs(rotDy) < 1.8 && Math.abs(this.visVySmooth) < 40;
+      const isExpandingFwd =
+        divAxes > 0 &&
+        (!hasHorizDiv || horizExp > 0.14) &&
+        (!hasVertDiv || vertExp > 0.09);
+      const isContractingBack =
+        divAxes > 0 &&
+        (!hasHorizDiv || horizExp < -0.14) &&
+        (!hasVertDiv || vertExp < -0.09);
+      // Forward radial expansion vs Backward radial contraction
+      if (isExpandingFwd && stableRotForDiv) {
         this.visForwardHoldFrames = Math.min(20, this.visForwardHoldFrames + 1);
+        this.visBackwardHoldFrames = Math.max(0, this.visBackwardHoldFrames - 2);
+      } else if (isContractingBack && stableRotForDiv) {
+        this.visBackwardHoldFrames = Math.min(20, this.visBackwardHoldFrames + 1);
+        this.visForwardHoldFrames = Math.max(0, this.visForwardHoldFrames - 2);
       } else {
         this.visForwardHoldFrames = Math.max(0, this.visForwardHoldFrames - 2);
+        this.visBackwardHoldFrames = Math.max(0, this.visBackwardHoldFrames - 2);
       }
-      this.visCoherentForward = this.visForwardHoldFrames >= 5;
+      this.visCoherentForward = this.visForwardHoldFrames >= 3;
+      this.visCoherentBackward = this.visBackwardHoldFrames >= 3;
 
       if (this.mode === 'camera-flow') {
         this.yawRad += dYaw * 1.18;
@@ -1402,10 +1521,11 @@ export class SensorFusionTracker extends xb.Script {
         }
       }
 
-      // Visual Walk / Run / Jump detection from Back-Camera stride bounce & forward expansion
+      // Visual Walk / Run / Jump / Crouch detection whenever back camera is active
+      // (Active in camera-flow OR in auto mode whenever IMU hasn't fired an actual step recently)
       if (
         this.locomotionEnabled &&
-        (this.mode === 'camera-flow' || now - this.lastSeen.linearAccel > 400)
+        (this.mode === 'camera-flow' || now - this.lastImuStepAt > 350)
       ) {
         this.processVisualCameraLocomotion(rotDx, rotDy, dtSec, now);
       }
@@ -1426,8 +1546,16 @@ export class SensorFusionTracker extends xb.Script {
   ): void {
     const safeDt = Math.max(dtSec, 0.016);
     // +vy: camera moving UP -> world moves DOWN (+rotDy)
-    const rawVy = rotDy / safeDt;
-    this.visVySmooth = THREE.MathUtils.lerp(this.visVySmooth, rawVy, 0.52);
+    const instantVy = rotDy / safeDt;
+    // 3-sample temporal median removes isolated 1-frame optical-flow texture glitches
+    const a = this.visRawVy2;
+    const b = this.visRawVy1;
+    const c = instantVy;
+    this.visRawVy2 = b;
+    this.visRawVy1 = c;
+    const rawVy =
+      a > b ? (b > c ? b : a > c ? c : a) : a > c ? a : b > c ? c : b;
+    this.visVySmooth = THREE.MathUtils.lerp(this.visVySmooth, rawVy, 0.58);
     const vy = this.visVySmooth;
     const vxAbs = Math.abs(rotDx / safeDt);
 
@@ -1437,20 +1565,35 @@ export class SensorFusionTracker extends xb.Script {
     this.latestVertAcc = Number((vertHp * 0.18).toFixed(1));
 
     // 1. Visual Jump Detector: Leg push-off surge (+vy upward) followed by apex fall (-vy downward)
-    const jumpLaunchVyMin = this.locomotionState === 'run' || this.visPeakNeg > 30 ? 64 : 50;
-    const jumpLaunchHpMin = this.locomotionState === 'run' || this.visPeakNeg > 30 ? 48 : 38;
-    if (vy > jumpLaunchVyMin && vertHp > jumpLaunchHpMin && vxAbs < Math.abs(vy) * 1.15) {
-      this.visJumpPrimedUntil = now + 520;
+    // Requires 2+ consecutive push-off frames so 1-frame glitches never false-trigger jump,
+    // while standstill/walking jumps indoors (3-5m room) trigger crisply.
+    const alreadyFastBounce = this.locomotionState === 'run' || this.visPeakNeg > 26;
+    const jumpLaunchVyMin = alreadyFastBounce ? 64 : 44;
+    const jumpLaunchHpMin = alreadyFastBounce ? 48 : 32;
+    if (
+      rawVy > jumpLaunchVyMin * 0.65 &&
+      vy > jumpLaunchVyMin &&
+      vertHp > jumpLaunchHpMin &&
+      vxAbs < Math.abs(vy) * 1.15
+    ) {
+      this.visJumpPrimeFrames += 1;
+      if (this.visJumpPrimeFrames >= 2) {
+        this.visJumpPrimedUntil = now + 540;
+      }
+    } else {
+      this.visJumpPrimeFrames = 0;
     }
     if (
       !this.isAirborne &&
       now > this.jumpCooldownUntil &&
       now <= this.visJumpPrimedUntil &&
-      (vy < -24 || vertHp < -22)
+      (vy < -17 || vertHp < -15)
     ) {
+      this.visJumpPrimeFrames = 0;
       this.visJumpPrimedUntil = 0;
       this.visPeakPos = 0;
       this.visPeakNeg = 0;
+      this.crouchTargetY = 0;
       this.triggerJump();
       return;
     }
@@ -1461,7 +1604,37 @@ export class SensorFusionTracker extends xb.Script {
       return;
     }
 
-    // 2. Visual Walk / Run Stride Bounce & Radial Expansion Detector
+    // 2. Visual Crouch / Squat Detector: sudden downward drop without preceding jump launch or stride peak
+    if (
+      now > this.visJumpPrimedUntil &&
+      (this.locomotionState === 'idle' ||
+        (this.locomotionState === 'walk' && this.locoSpeed < 0.9)) &&
+      this.visPeakPos < 14 &&
+      vy < -24 &&
+      vertHp < -19 &&
+      vxAbs < Math.abs(vy) * 1.25
+    ) {
+      this.crouchTargetY = -0.34;
+      this.crouchUntil = now + 1500;
+      this.locoSpeed = 0;
+      this.locoHoldUntil = 0;
+      this.visPeakPos = 0;
+      this.visPeakNeg = 0;
+      this.locomotionState = 'crouch';
+      return;
+    } else if (this.crouchTargetY < -0.05 && vy > 18 && vertHp > 16) {
+      this.crouchTargetY = 0;
+      this.crouchUntil = 0;
+      this.visPeakPos = 0;
+      this.visPeakNeg = 0;
+    }
+    if (this.crouchTargetY < -0.05) {
+      this.visPeakPos = 0;
+      this.visPeakNeg = 0;
+      return;
+    }
+
+    // 3. Visual Walk / Run / Backward-Walk Stride & Radial Expansion Detector
     // Use ~600ms envelope memory so first half-stride peak persists until opposite footstrike
     const envDecay = Math.exp(-safeDt * 1.15);
     this.visPeakPos = Math.max(this.visPeakPos * envDecay, vertHp > 0 ? vertHp : 0);
@@ -1469,27 +1642,33 @@ export class SensorFusionTracker extends xb.Script {
     const bounceAmp = this.visPeakPos + this.visPeakNeg;
 
     const isFastVisualMotion =
-      bounceAmp > 46 || (this.visCoherentForward && this.visDivergenceLp > 0.48);
+      bounceAmp > 44 || (this.visCoherentForward && this.visDivergenceLp > 0.62);
     const hasStepOscillation =
-      this.visPeakPos > 8.5 &&
-      this.visPeakNeg > 8.5 &&
-      bounceAmp > 18 &&
-      vertHp < -5.5 &&
-      vy < -4.0;
+      this.visPeakPos > 6.5 &&
+      this.visPeakNeg > 6.5 &&
+      bounceAmp > 14 &&
+      vertHp < -4.5 &&
+      vy < -3.2;
     const spanSinceLast = this.lastStepAt > 0 ? now - this.lastStepAt : 560;
     const isRapidStride =
       hasStepOscillation &&
-      this.visPeakPos > 15 &&
-      this.visPeakNeg > 15 &&
+      this.visPeakPos > 13 &&
+      this.visPeakNeg > 13 &&
       spanSinceLast > 180 &&
-      spanSinceLast < 395;
+      spanSinceLast < 400;
     const isRunningVisual = isFastVisualMotion || isRapidStride;
-    const minStrideIntervalMs = isRunningVisual ? 260 : 490;
+    const minStrideIntervalMs = isRunningVisual ? 260 : 480;
     if (now - this.lastStepAt < minStrideIntervalMs) return;
 
-    const hasForwardCruise = this.visCoherentForward && this.visDivergenceLp > 0.14;
+    const hasForwardCruise = this.visCoherentForward && this.visDivergenceLp > 0.11;
+    const hasBackwardCruise = this.visCoherentBackward && this.visDivergenceLp < -0.11;
 
-    if (hasStepOscillation || hasForwardCruise) {
+    if (hasStepOscillation || hasForwardCruise || hasBackwardCruise) {
+      if (hasBackwardCruise || (!hasForwardCruise && this.visDivergenceLp < -0.11)) {
+        this.visMoveSign = -1;
+      } else {
+        this.visMoveSign = 1;
+      }
       const equivAccel = isRunningVisual
         ? Math.max(4.9, THREE.MathUtils.clamp(bounceAmp * 0.11, 4.9, 6.2))
         : THREE.MathUtils.clamp(Math.max(2.3, bounceAmp * 0.085), 2.3, 3.6);
@@ -1547,11 +1726,21 @@ export class SensorFusionTracker extends xb.Script {
     this.hasPrevLuma = false;
     this.visVertLp = 0;
     this.visVySmooth = 0;
+    this.visRawVy1 = 0;
+    this.visRawVy2 = 0;
     this.visPeakPos = 0;
     this.visPeakNeg = 0;
     this.visForwardHoldFrames = 0;
+    this.visBackwardHoldFrames = 0;
     this.visCoherentForward = false;
+    this.visCoherentBackward = false;
+    this.visMoveSign = 1;
+    this.crouchOffsetY = 0;
+    this.crouchTargetY = 0;
+    this.crouchUntil = 0;
+    this.patchContrast.fill(0);
     this.visDivergenceLp = 0;
+    this.visJumpPrimeFrames = 0;
     this.visJumpPrimedUntil = 0;
   }
 
@@ -1711,7 +1900,16 @@ export class SensorFusionTracker extends xb.Script {
       now - this.lastSeen.keyboard < 5000 ||
       this.demoSweepActive;
 
-    // Update Jump & Walk/Run 3D locomotion physics
+    // Update Jump, Crouch & Walk/Run 3D locomotion physics
+    if (now > this.crouchUntil) {
+      this.crouchTargetY = 0;
+    }
+    this.crouchOffsetY = THREE.MathUtils.lerp(
+      this.crouchOffsetY,
+      this.crouchTargetY,
+      Math.min(1, dt * 8.5)
+    );
+
     if (this.isAirborne) {
       this.jumpHeightY += this.jumpVelY * dt;
       this.jumpVelY -= 11.8 * dt;
@@ -1728,7 +1926,10 @@ export class SensorFusionTracker extends xb.Script {
       this.locoSpeed = THREE.MathUtils.lerp(this.locoSpeed, 0, Math.min(1, dt * 7.5));
       if (this.locoSpeed < 0.15) {
         this.locoSpeed = 0;
-        this.locomotionState = 'idle';
+        this.locomotionState =
+          Math.abs(this.crouchOffsetY) > 0.08 || this.crouchTargetY < -0.05
+            ? 'crouch'
+            : 'idle';
       }
     }
 
@@ -1739,9 +1940,12 @@ export class SensorFusionTracker extends xb.Script {
         this._camFwdXZ.y = 0;
         if (this._camFwdXZ.lengthSq() > 1e-4) {
           this._camFwdXZ.normalize();
-          this._locoOffsetXZ.addScaledVector(this._camFwdXZ, this.locoSpeed * 0.42 * dt);
-          if (this._locoOffsetXZ.length() > 3.7) {
-            this._locoOffsetXZ.setLength(3.7);
+          this._locoOffsetXZ.addScaledVector(
+            this._camFwdXZ,
+            this.visMoveSign * this.locoSpeed * 0.48 * dt
+          );
+          if (this._locoOffsetXZ.length() > 6.5) {
+            this._locoOffsetXZ.setLength(6.5);
           }
         }
         const isRun = this.locomotionState === 'run';
@@ -1785,14 +1989,18 @@ export class SensorFusionTracker extends xb.Script {
         .add(this._locoOffsetXZ)
         .add(this._neckOffset)
         .add(this._neckPivotVec);
-      xb.core.camera.position.y += this.jumpHeightY + bobOffsetY;
-    } else if (!isXrPresenting && xb.core.camera && (this.isAirborne || this.locoSpeed > 0.1)) {
+      xb.core.camera.position.y += this.jumpHeightY + bobOffsetY + this.crouchOffsetY;
+    } else if (
+      !isXrPresenting &&
+      xb.core.camera &&
+      (this.isAirborne || this.locoSpeed > 0.1 || Math.abs(this.crouchOffsetY) > 0.01)
+    ) {
       if (!this.hasBaseCamPos) {
         this._baseCamPos.copy(xb.core.camera.position);
         this.hasBaseCamPos = true;
       }
       xb.core.camera.position.copy(this._baseCamPos).add(this._locoOffsetXZ);
-      xb.core.camera.position.y += this.jumpHeightY + bobOffsetY;
+      xb.core.camera.position.y += this.jumpHeightY + bobOffsetY + this.crouchOffsetY;
     }
 
     // Track head angular velocity on camera/head pose for Nod & Shake gestures
@@ -1919,8 +2127,18 @@ export class SensorFusionTracker extends xb.Script {
       locomotion: {
         enabled: this.locomotionEnabled,
         state: this.locomotionState,
+        moveDirection:
+          this.locoSpeed > 0.15
+            ? this.visMoveSign < 0
+              ? 'backward'
+              : 'forward'
+            : 'none',
+        crouching: Math.abs(this.crouchOffsetY) > 0.08 || this.crouchTargetY < -0.05,
         stepCount: this.stepCount,
-        cadenceSpm: this.locomotionState === 'idle' ? 0 : this.cadenceSpm,
+        cadenceSpm:
+          this.locomotionState === 'idle' || this.locomotionState === 'crouch'
+            ? 0
+            : this.cadenceSpm,
         speedMps: Number(this.locoSpeed.toFixed(1)),
         jumpHeightM: Number(this.jumpHeightY.toFixed(2)),
         verticalAccelMs2: Number(this.latestVertAcc.toFixed(1)),
@@ -1953,6 +2171,8 @@ export class SensorFusionTracker extends xb.Script {
     headsetTap: boolean;
     accelMag: number;
     stepEvent: 'none' | 'walk' | 'run';
+    moveDirection: 'forward' | 'backward';
+    crouching: boolean;
     jumped: boolean;
     landed: boolean;
   } {
@@ -1976,6 +2196,8 @@ export class SensorFusionTracker extends xb.Script {
       headsetTap,
       accelMag: this.latestLinearAccelMag,
       stepEvent,
+      moveDirection: this.visMoveSign < 0 ? 'backward' : 'forward',
+      crouching: Math.abs(this.crouchOffsetY) > 0.08 || this.crouchTargetY < -0.05,
       jumped,
       landed,
     };
