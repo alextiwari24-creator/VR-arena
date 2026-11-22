@@ -23,6 +23,7 @@ export interface HeadGazeCallbacks {
     speedMps: number,
     jumpHeightM: number
   ) => void;
+  getHoveredScreenHint?: (hitPoint: THREE.Vector3 | null) => {id: string; label: string} | null;
   onStatusUpdate?: (label: string) => void;
 }
 
@@ -60,6 +61,7 @@ export class HeadGazeController extends xb.Script {
   private currentTargetKind: 'button' | 'slider' | 'input' | 'scroll' | 'screen' | 'toy' | 'none' =
     'none';
   private currentTargetLabel = '';
+  private currentScreenBoxId: string | null = null;
   private dwellElapsed = 0;
   private dwellTriggered = false;
   private lookDownElapsed = 0;
@@ -537,20 +539,30 @@ export class HeadGazeController extends xb.Script {
     }
 
     // 3d. Curved Theater Screen
+    let hoveredScreenBoxId: string | null = null;
     if (!hitTarget && this.theaterScreen) {
       const screenHits = this._raycaster.intersectObject(this.theaterScreen, false);
       if (screenHits.length > 0 && screenHits[0].distance < bestDist) {
         bestDist = screenHits[0].distance;
         hitTarget = this.theaterScreen;
         hitKind = 'screen';
-        hitLabel =
-          mode === 'hub'
-            ? 'Curved Screen (Space/Nod/Dwell to Launch)'
-            : mode === 'google-workspace'
-              ? 'Live Google Screen (Space/Dwell to Refresh)'
-              : 'VR Theater Screen';
         this._hitPoint.copy(screenHits[0].point);
+        const hint = this.callbacks.getHoveredScreenHint?.(this._hitPoint) ?? null;
+        if (hint) {
+          hoveredScreenBoxId = hint.id;
+          hitLabel = hint.label;
+        } else {
+          hitLabel =
+            mode === 'hub'
+              ? 'Device Home Screen (Look at any App / Mirror)'
+              : mode === 'google-workspace' || mode === 'google-suite-launch'
+                ? 'Live Google Screen (Look at Item / Action)'
+                : 'VR Theater Screen';
+        }
       }
+    }
+    if (hitKind !== 'screen') {
+      this.callbacks.getHoveredScreenHint?.(null);
     }
 
     // Position the 3D gaze reticle just slightly toward the camera from the hit point
@@ -610,10 +622,13 @@ export class HeadGazeController extends xb.Script {
 
     // 5. Dwell state machine + Instant Nod / Headset Tap / Button trigger
     const targetChanged = hitTarget !== this.currentTarget;
-    if (targetChanged) {
+    const screenBoxChanged =
+      hitKind === 'screen' && hoveredScreenBoxId !== this.currentScreenBoxId;
+    if (targetChanged || screenBoxChanged) {
       this.currentTarget = hitTarget;
       this.currentTargetKind = hitKind;
       this.currentTargetLabel = hitLabel;
+      this.currentScreenBoxId = hitKind === 'screen' ? hoveredScreenBoxId : null;
       this.dwellElapsed = 0;
       this.dwellTriggered = false;
       if (hitKind === 'button' && hitTarget instanceof xb.UIButton) {
@@ -621,7 +636,7 @@ export class HeadGazeController extends xb.Script {
       } else {
         this.clearButtonHighlight();
       }
-      if (hitTarget && hitKind !== 'scroll') {
+      if (hitTarget && hitKind !== 'scroll' && (hitKind !== 'screen' || hoveredScreenBoxId !== null)) {
         this.sound.playHoverTick();
       }
     }
@@ -635,7 +650,18 @@ export class HeadGazeController extends xb.Script {
         hitKind === 'button' && Boolean((hitTarget as xb.UIButton).disabled);
 
       if (!isDisabledBtn) {
-        this.dwellElapsed += dt;
+        const allowScreenDwell =
+          hitKind !== 'screen' ||
+          hoveredScreenBoxId !== null ||
+          mode === 'cinema-deck' ||
+          mode === 'neon-racer' ||
+          mode === 'cosmic-blaster' ||
+          mode === 'control-scheme';
+        if (allowScreenDwell) {
+          this.dwellElapsed += dt;
+        } else {
+          this.dwellElapsed = 0;
+        }
         const droneDwell = motion.locoState === 'run' ? DWELL_DRONE_SEC * 0.52 : DWELL_DRONE_SEC;
         const requiredSec =
           hitKind === 'slider'
@@ -643,7 +669,9 @@ export class HeadGazeController extends xb.Script {
             : hitKind === 'toy' && mode === 'cosmic-blaster'
               ? droneDwell
               : hitKind === 'screen'
-                ? DWELL_SCREEN_SEC
+                ? hoveredScreenBoxId !== null
+                  ? DWELL_UI_SEC
+                  : DWELL_SCREEN_SEC
                 : DWELL_UI_SEC;
 
         const progress = Math.min(1, this.dwellElapsed / requiredSec);
@@ -801,7 +829,9 @@ export class HeadGazeController extends xb.Script {
       this.currentTargetKind === 'slider'
         ? DWELL_SLIDER_SEC
         : this.currentTargetKind === 'screen'
-          ? DWELL_SCREEN_SEC
+          ? this.currentScreenBoxId !== null
+            ? DWELL_UI_SEC
+            : DWELL_SCREEN_SEC
           : DWELL_UI_SEC;
     return {
       enabled: this.enabled,

@@ -258,6 +258,208 @@ async function startServer() {
     }
   });
 
+  app.get('/api/google/image', async (req, res) => {
+    const rawUrl = String(req.query.url ?? '');
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return res.status(400).send('Invalid URL');
+    }
+    const allowedHosts = new Set([
+      'i.ytimg.com',
+      'img.youtube.com',
+      'yt3.ggpht.com',
+      'play-lh.googleusercontent.com',
+      'lh3.googleusercontent.com',
+      'upload.wikimedia.org',
+    ]);
+    if (parsed.protocol !== 'https:' || !allowedHosts.has(parsed.hostname)) {
+      return res.status(400).send('Disallowed image host');
+    }
+    try {
+      const upstream = await fetch(rawUrl, {
+        headers: {'User-Agent': PLAY_USER_AGENT},
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!upstream.ok) return res.status(upstream.status).end();
+      const ct = upstream.headers.get('content-type') || 'image/jpeg';
+      if (!ct.startsWith('image/')) return res.status(400).send('Not an image');
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader('Content-Type', ct);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.send(buf);
+    } catch {
+      return res.status(502).end();
+    }
+  });
+
+  app.get('/api/google/youtube', async (req, res) => {
+    const q = String(req.query.q ?? 'VR 360 4K immersive').trim() || 'VR 360 4K immersive';
+    const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&hl=en&gl=US`;
+    try {
+      const response = await fetch(targetUrl, {
+        headers: {
+          'User-Agent': PLAY_USER_AGENT,
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!response.ok) {
+        return res.status(502).json({error: `YouTube returned ${response.status}`});
+      }
+      const html = await response.text();
+      const marker = 'var ytInitialData = ';
+      const idx = html.indexOf(marker);
+      const items: Array<{
+        videoId: string;
+        title: string;
+        channel: string;
+        duration: string;
+        views: string;
+        thumbnailUrl: string;
+        watchUrl: string;
+      }> = [];
+
+      if (idx !== -1) {
+        const jsonStart = idx + marker.length;
+        const jsonEnd = html.indexOf(';</script>', jsonStart);
+        if (jsonEnd !== -1) {
+          const parsed = JSON.parse(html.slice(jsonStart, jsonEnd)) as Record<string, unknown>;
+          const stack: unknown[] = [parsed];
+          const seenIds = new Set<string>();
+          while (stack.length > 0 && items.length < 10) {
+            const node = stack.pop();
+            if (!node || typeof node !== 'object') continue;
+            if (Array.isArray(node)) {
+              for (let i = node.length - 1; i >= 0; i--) stack.push(node[i]);
+              continue;
+            }
+            const obj = node as Record<string, unknown>;
+            const vr = obj.videoRenderer as Record<string, unknown> | undefined;
+            if (vr && typeof vr.videoId === 'string' && !seenIds.has(vr.videoId)) {
+              seenIds.add(vr.videoId);
+              const titleObj = vr.title as {runs?: Array<{text?: string}>} | undefined;
+              const title = titleObj?.runs?.map((r) => r.text ?? '').join('') || 'YouTube Video';
+              const ownerObj = vr.ownerText as {runs?: Array<{text?: string}>} | undefined;
+              const channel = ownerObj?.runs?.[0]?.text || 'YouTube Creator';
+              const lenObj = vr.lengthText as {simpleText?: string} | undefined;
+              const duration = lenObj?.simpleText || 'LIVE';
+              const viewObj = vr.shortViewCountText as {simpleText?: string} | undefined;
+              const views = viewObj?.simpleText || '';
+              const rawThumb = `https://i.ytimg.com/vi/${vr.videoId}/hqdefault.jpg`;
+              items.push({
+                videoId: vr.videoId,
+                title: decodeHtmlEntities(title),
+                channel: decodeHtmlEntities(channel),
+                duration,
+                views,
+                thumbnailUrl: `/api/google/image?url=${encodeURIComponent(rawThumb)}`,
+                watchUrl: `https://www.youtube.com/watch?v=${vr.videoId}`,
+              });
+              continue;
+            }
+            for (const val of Object.values(obj)) {
+              if (val && typeof val === 'object') stack.push(val);
+            }
+          }
+        }
+      }
+
+      return res.json({query: q, url: targetUrl, items});
+    } catch (err) {
+      return res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to reach YouTube',
+      });
+    }
+  });
+
+  app.get('/api/google/web', async (req, res) => {
+    const rawUrl = String(req.query.url ?? '').trim();
+    const query = String(req.query.q ?? '').trim();
+
+    if (rawUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(rawUrl);
+      } catch {
+        return res.status(400).json({error: 'Invalid URL'});
+      }
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        return res.status(400).json({error: 'Only HTTP/HTTPS URLs are supported'});
+      }
+      try {
+        const resp = await fetch(rawUrl, {
+          headers: {'User-Agent': PLAY_USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9'},
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) {
+          return res.status(502).json({error: `Site returned ${resp.status}`});
+        }
+        const html = await resp.text();
+        const title = decodeHtmlEntities(
+          html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/<[^>]+>/g, '') || parsed.hostname
+        );
+        const desc = decodeHtmlEntities(
+          html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i)?.[1] || ''
+        );
+        const stripped = html
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ');
+        const paras: string[] = [];
+        const pRe = /<(?:p|h1|h2|h3|li)[^>]*>([\s\S]*?)<\/(?:p|h1|h2|h3|li)>/gi;
+        let m: RegExpExecArray | null;
+        while ((m = pRe.exec(stripped)) !== null && paras.length < 10) {
+          const txt = decodeHtmlEntities(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+          if (txt.length >= 24) paras.push(txt);
+        }
+        return res.json({
+          mode: 'page',
+          url: rawUrl,
+          title,
+          description: desc,
+          paragraphs: paras,
+        });
+      } catch (err) {
+        return res.status(502).json({
+          error: err instanceof Error ? err.message : 'Failed to fetch webpage',
+        });
+      }
+    }
+
+    // Live Google News RSS + Wikipedia search
+    const rssUrl = query
+      ? `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`
+      : 'https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en';
+    try {
+      const resp = await fetch(rssUrl, {
+        headers: {'User-Agent': PLAY_USER_AGENT},
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) {
+        return res.status(502).json({error: `News feed returned ${resp.status}`});
+      }
+      const xml = await resp.text();
+      const items: Array<{title: string; source: string; pubDate: string; link: string}> = [];
+      const itemRe = /<item>([\s\S]*?)<\/item>/g;
+      let m: RegExpExecArray | null;
+      while ((m = itemRe.exec(xml)) !== null && items.length < 8) {
+        const block = m[1];
+        const title = decodeHtmlEntities(block.match(/<title>([\s\S]*?)<\/title>/)?.[1] || '');
+        const link = decodeHtmlEntities(block.match(/<link>([\s\S]*?)<\/link>/)?.[1] || '');
+        const pubDate = decodeHtmlEntities(block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || '');
+        const source = decodeHtmlEntities(block.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1] || 'Google News');
+        if (title) items.push({title, source, pubDate, link});
+      }
+      return res.json({mode: 'search', query: query || 'Top Headlines', url: rssUrl, items});
+    } catch (err) {
+      return res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to reach web feed',
+      });
+    }
+  });
+
   const isProd = process.env.NODE_ENV === 'production';
   const distDir = path.resolve(__dirname, 'dist');
 

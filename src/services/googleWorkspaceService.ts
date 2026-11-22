@@ -53,6 +53,11 @@ export interface WorkspaceFeedItem {
   title: string;
   detail: string;
   meta?: string;
+  fullText?: string;
+  linkUrl?: string;
+  tableRows?: string[][];
+  imageUrl?: string;
+  videoId?: string;
 }
 
 export interface WorkspaceFeedResult {
@@ -63,6 +68,7 @@ export interface WorkspaceFeedResult {
   requiresAuth: boolean;
   error?: string;
   fetchedAt: number;
+  selectedLinkUrl?: string;
 }
 
 type AuthListener = (snapshot: GoogleAuthSnapshot) => void;
@@ -260,17 +266,19 @@ export async function fetchGoogleWorkspaceFeed(
 
 async function fetchGmailFeed(token: string): Promise<WorkspaceFeedResult> {
   const list = await fetchGoogleJson<{messages?: Array<{id: string}>}>(
-    'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=6',
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8',
     token
   );
-  const ids = (list.messages ?? []).slice(0, 5).map((m) => m.id);
+  const ids = (list.messages ?? []).slice(0, 6).map((m) => m.id);
   const items: WorkspaceFeedItem[] = [];
 
   if (ids.length > 0) {
     const details = await Promise.all(
       ids.map((id) =>
         fetchGoogleJson<{
+          id: string;
           snippet?: string;
+          labelIds?: string[];
           payload?: {headers?: Array<{name: string; value: string}>};
         }>(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
@@ -285,10 +293,15 @@ async function fetchGmailFeed(token: string): Promise<WorkspaceFeedResult> {
       const subject =
         headers.find((h) => h.name.toLowerCase() === 'subject')?.value || '(No Subject)';
       const from = headers.find((h) => h.name.toLowerCase() === 'from')?.value || 'Unknown Sender';
+      const dateRaw = headers.find((h) => h.name.toLowerCase() === 'date')?.value || '';
+      const unread = msg.labelIds?.includes('UNREAD') ? 'UNREAD • ' : '';
+      const cleanFrom = from.replace(/<.*?>/g, '').trim();
       items.push({
-        title: subject,
+        title: `${unread}${subject}`,
         detail: msg.snippet || '',
-        meta: from.replace(/<.*?>/g, '').trim(),
+        meta: cleanFrom,
+        fullText: `From: ${from}\nDate: ${dateRaw}\n\n${msg.snippet || ''}`,
+        linkUrl: `https://mail.google.com/mail/u/0/#inbox/${encodeURIComponent(msg.id)}`,
       });
     }
   }
@@ -300,23 +313,34 @@ async function fetchGmailFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://mail.google.com',
   };
 }
 
 async function fetchDriveFeed(token: string): Promise<WorkspaceFeedResult> {
   const data = await fetchGoogleJson<{
-    files?: Array<{id: string; name: string; mimeType: string; modifiedTime?: string}>;
+    files?: Array<{
+      id: string;
+      name: string;
+      mimeType: string;
+      modifiedTime?: string;
+      size?: string;
+      webViewLink?: string;
+    }>;
   }>(
-    'https://www.googleapis.com/drive/v3/files?pageSize=7&orderBy=modifiedTime%20desc&fields=files(id,name,mimeType,modifiedTime)',
+    'https://www.googleapis.com/drive/v3/files?pageSize=8&orderBy=modifiedTime%20desc&fields=files(id,name,mimeType,modifiedTime,size,webViewLink)',
     token
   );
   const items: WorkspaceFeedItem[] = (data.files ?? []).map((f) => {
     const typeLabel = f.mimeType.split('.').pop()?.toUpperCase() || 'FILE';
     const dateLabel = f.modifiedTime ? new Date(f.modifiedTime).toLocaleDateString() : '';
+    const sizeKb = f.size ? ` • ${Math.max(1, Math.round(Number(f.size) / 1024))} KB` : '';
     return {
       title: f.name,
-      detail: `Type: ${typeLabel}`,
+      detail: `Type: ${typeLabel}${sizeKb}`,
       meta: dateLabel,
+      fullText: `File: ${f.name}\nMIME: ${f.mimeType}\nUpdated: ${dateLabel || 'Recent'}${sizeKb}`,
+      linkUrl: f.webViewLink || `https://drive.google.com/file/d/${encodeURIComponent(f.id)}/view`,
     };
   });
 
@@ -327,6 +351,7 @@ async function fetchDriveFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://drive.google.com',
   };
 }
 
@@ -336,20 +361,49 @@ async function fetchCalendarFeed(token: string): Promise<WorkspaceFeedResult> {
     items?: Array<{
       summary?: string;
       location?: string;
+      description?: string;
+      hangoutLink?: string;
+      htmlLink?: string;
       start?: {dateTime?: string; date?: string};
+      end?: {dateTime?: string; date?: string};
     }>;
   }>(
-    `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${nowIso}&maxResults=7&singleEvents=true&orderBy=startTime`,
+    `https://www.calendar.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${nowIso}&maxResults=8&singleEvents=true&orderBy=startTime`,
     token
+  ).catch(() =>
+    fetchGoogleJson<{
+      items?: Array<{
+        summary?: string;
+        location?: string;
+        description?: string;
+        hangoutLink?: string;
+        htmlLink?: string;
+        start?: {dateTime?: string; date?: string};
+        end?: {dateTime?: string; date?: string};
+      }>;
+    }>(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${nowIso}&maxResults=8&singleEvents=true&orderBy=startTime`,
+      token
+    )
   );
 
   const items: WorkspaceFeedItem[] = (data.items ?? []).map((ev) => {
     const startRaw = ev.start?.dateTime || ev.start?.date || '';
     const when = startRaw ? new Date(startRaw).toLocaleString() : 'Scheduled';
+    const meetNote = ev.hangoutLink ? `Meet: ${ev.hangoutLink}` : '';
     return {
       title: ev.summary || '(Untitled Event)',
-      detail: ev.location ? `Location: ${ev.location}` : when,
+      detail: ev.location ? `Location: ${ev.location}` : meetNote || when,
       meta: when,
+      fullText: [
+        `When: ${when}`,
+        ev.location ? `Where: ${ev.location}` : '',
+        meetNote,
+        ev.description ? ev.description.replace(/<[^>]+>/g, ' ').slice(0, 260) : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      linkUrl: ev.hangoutLink || ev.htmlLink || 'https://calendar.google.com',
     };
   });
 
@@ -360,6 +414,7 @@ async function fetchCalendarFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://calendar.google.com',
   };
 }
 
@@ -368,9 +423,9 @@ async function fetchDocsFeed(token: string): Promise<WorkspaceFeedResult> {
     "mimeType='application/vnd.google-apps.document' and trashed=false"
   );
   const list = await fetchGoogleJson<{
-    files?: Array<{id: string; name: string; modifiedTime?: string}>;
+    files?: Array<{id: string; name: string; modifiedTime?: string; webViewLink?: string}>;
   }>(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime)`,
+    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime,webViewLink)`,
     token
   );
 
@@ -382,8 +437,9 @@ async function fetchDocsFeed(token: string): Promise<WorkspaceFeedResult> {
     let excerpt = f.modifiedTime
       ? `Updated ${new Date(f.modifiedTime).toLocaleDateString()}`
       : 'Google Docs Document';
+    let fullText = excerpt;
 
-    if (i === 0) {
+    if (i < 2) {
       try {
         const doc = await fetchGoogleJson<{
           body?: {
@@ -395,11 +451,12 @@ async function fetchDocsFeed(token: string): Promise<WorkspaceFeedResult> {
         const text = (doc.body?.content ?? [])
           .flatMap((c) => c.paragraph?.elements ?? [])
           .map((el) => el.textRun?.content ?? '')
-          .join(' ')
-          .replace(/\s+/g, ' ')
+          .join('')
+          .replace(/\n{3,}/g, '\n\n')
           .trim();
         if (text) {
-          excerpt = text.slice(0, 96);
+          excerpt = text.replace(/\s+/g, ' ').slice(0, 96);
+          fullText = text.slice(0, 900);
         }
       } catch {
         // Keep modified date fallback if doc read fails
@@ -410,6 +467,8 @@ async function fetchDocsFeed(token: string): Promise<WorkspaceFeedResult> {
       title: f.name,
       detail: excerpt,
       meta: 'DOCS',
+      fullText,
+      linkUrl: f.webViewLink || `https://docs.google.com/document/d/${encodeURIComponent(f.id)}/edit`,
     });
   }
 
@@ -420,6 +479,7 @@ async function fetchDocsFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://docs.google.com',
   };
 }
 
@@ -428,9 +488,9 @@ async function fetchSheetsFeed(token: string): Promise<WorkspaceFeedResult> {
     "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
   );
   const list = await fetchGoogleJson<{
-    files?: Array<{id: string; name: string; modifiedTime?: string}>;
+    files?: Array<{id: string; name: string; modifiedTime?: string; webViewLink?: string}>;
   }>(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime)`,
+    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime,webViewLink)`,
     token
   );
 
@@ -442,6 +502,7 @@ async function fetchSheetsFeed(token: string): Promise<WorkspaceFeedResult> {
     let detail = f.modifiedTime
       ? `Modified ${new Date(f.modifiedTime).toLocaleDateString()}`
       : 'Google Spreadsheet';
+    let tableRows: string[][] | undefined;
 
     if (i === 0) {
       try {
@@ -453,12 +514,24 @@ async function fetchSheetsFeed(token: string): Promise<WorkspaceFeedResult> {
           )}?fields=properties.title,sheets.properties.title`,
           token
         );
+        const firstTab = sheet.sheets?.[0]?.properties?.title;
         const tabNames = (sheet.sheets ?? [])
           .map((s) => s.properties?.title)
           .filter(Boolean)
           .join(', ');
         if (tabNames) {
           detail = `Tabs: ${tabNames}`;
+        }
+        if (firstTab) {
+          const valRes = await fetchGoogleJson<{values?: string[][]}>(
+            `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+              f.id
+            )}/values/${encodeURIComponent(`${firstTab}!A1:E7`)}`,
+            token
+          );
+          if (valRes.values && valRes.values.length > 0) {
+            tableRows = valRes.values;
+          }
         }
       } catch {
         // Keep fallback
@@ -469,6 +542,9 @@ async function fetchSheetsFeed(token: string): Promise<WorkspaceFeedResult> {
       title: f.name,
       detail,
       meta: 'SHEETS',
+      tableRows,
+      linkUrl:
+        f.webViewLink || `https://docs.google.com/spreadsheets/d/${encodeURIComponent(f.id)}/edit`,
     });
   }
 
@@ -479,6 +555,7 @@ async function fetchSheetsFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://sheets.google.com',
   };
 }
 
@@ -487,9 +564,9 @@ async function fetchSlidesFeed(token: string): Promise<WorkspaceFeedResult> {
     "mimeType='application/vnd.google-apps.presentation' and trashed=false"
   );
   const list = await fetchGoogleJson<{
-    files?: Array<{id: string; name: string; modifiedTime?: string}>;
+    files?: Array<{id: string; name: string; modifiedTime?: string; webViewLink?: string}>;
   }>(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime)`,
+    `https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=6&orderBy=modifiedTime%20desc&fields=files(id,name,modifiedTime,webViewLink)`,
     token
   );
 
@@ -501,17 +578,39 @@ async function fetchSlidesFeed(token: string): Promise<WorkspaceFeedResult> {
     let detail = f.modifiedTime
       ? `Updated ${new Date(f.modifiedTime).toLocaleDateString()}`
       : 'Google Presentation';
+    let fullText = detail;
 
     if (i === 0) {
       try {
-        const pres = await fetchGoogleJson<{slides?: Array<{objectId?: string}>}>(
+        const pres = await fetchGoogleJson<{
+          slides?: Array<{
+            objectId?: string;
+            pageElements?: Array<{
+              shape?: {
+                text?: {
+                  textElements?: Array<{textRun?: {content?: string}}>;
+                };
+              };
+            }>;
+          }>;
+        }>(
           `https://slides.googleapis.com/v1/presentations/${encodeURIComponent(
             f.id
-          )}?fields=title,slides.objectId`,
+          )}?fields=title,slides(objectId,pageElements.shape.text.textElements.textRun.content)`,
           token
         );
         if (pres.slides) {
-          detail = `${pres.slides.length} slides ready for VR Theater`;
+          detail = `${pres.slides.length} slides ready in VR`;
+          const slideSummaries = pres.slides.slice(0, 6).map((s, idx) => {
+            const text = (s.pageElements ?? [])
+              .flatMap((el) => el.shape?.text?.textElements ?? [])
+              .map((te) => te.textRun?.content ?? '')
+              .join(' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+            return `Slide ${idx + 1}: ${text || '(Visual Slide)'}`;
+          });
+          fullText = slideSummaries.join('\n');
         }
       } catch {
         // Keep fallback
@@ -522,6 +621,9 @@ async function fetchSlidesFeed(token: string): Promise<WorkspaceFeedResult> {
       title: f.name,
       detail,
       meta: 'SLIDES',
+      fullText,
+      linkUrl:
+        f.webViewLink || `https://docs.google.com/presentation/d/${encodeURIComponent(f.id)}/edit`,
     });
   }
 
@@ -532,14 +634,15 @@ async function fetchSlidesFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: items[0]?.linkUrl ?? 'https://slides.google.com',
   };
 }
 
 async function fetchTasksFeed(token: string): Promise<WorkspaceFeedResult> {
   const data = await fetchGoogleJson<{
-    items?: Array<{title?: string; status?: string; due?: string}>;
+    items?: Array<{title?: string; status?: string; due?: string; notes?: string}>;
   }>(
-    'https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?maxResults=8&showCompleted=true',
+    'https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?maxResults=10&showCompleted=true',
     token
   );
 
@@ -547,8 +650,14 @@ async function fetchTasksFeed(token: string): Promise<WorkspaceFeedResult> {
     .filter((t) => Boolean(t.title))
     .map((t) => ({
       title: `${t.status === 'completed' ? '✓' : '○'} ${t.title ?? 'Task'}`,
-      detail: t.due ? `Due: ${new Date(t.due).toLocaleDateString()}` : t.status ?? 'needsAction',
+      detail: t.due
+        ? `Due: ${new Date(t.due).toLocaleDateString()}`
+        : t.notes || t.status || 'needsAction',
       meta: t.status === 'completed' ? 'DONE' : 'OPEN',
+      fullText: [t.title, t.notes, t.due ? `Due ${new Date(t.due).toLocaleString()}` : '']
+        .filter(Boolean)
+        .join('\n'),
+      linkUrl: 'https://tasks.google.com',
     }));
 
   return {
@@ -558,6 +667,7 @@ async function fetchTasksFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: 'https://tasks.google.com',
   };
 }
 
@@ -567,9 +677,10 @@ async function fetchContactsFeed(token: string): Promise<WorkspaceFeedResult> {
       names?: Array<{displayName?: string}>;
       emailAddresses?: Array<{value?: string}>;
       phoneNumbers?: Array<{value?: string}>;
+      organizations?: Array<{name?: string; title?: string}>;
     }>;
   }>(
-    'https://people.googleapis.com/v1/people/me/connections?personFields=names,emailAddresses,phoneNumbers&pageSize=8',
+    'https://people.googleapis.com/v1/people/me/connections?personFields=names,emailAddresses,phoneNumbers,organizations&pageSize=8',
     token
   );
 
@@ -577,10 +688,15 @@ async function fetchContactsFeed(token: string): Promise<WorkspaceFeedResult> {
     const name = p.names?.[0]?.displayName || 'Unnamed Contact';
     const email = p.emailAddresses?.[0]?.value || '';
     const phone = p.phoneNumbers?.[0]?.value || '';
+    const org = p.organizations?.[0]?.name || '';
     return {
       title: name,
-      detail: [email, phone].filter(Boolean).join(' • ') || 'Google Contact',
+      detail: [email, phone, org].filter(Boolean).join(' • ') || 'Google Contact',
       meta: 'CONTACT',
+      fullText: [name, email && `Email: ${email}`, phone && `Phone: ${phone}`, org && `Org: ${org}`]
+        .filter(Boolean)
+        .join('\n'),
+      linkUrl: 'https://contacts.google.com',
     };
   });
 
@@ -591,5 +707,36 @@ async function fetchContactsFeed(token: string): Promise<WorkspaceFeedResult> {
     items,
     requiresAuth: false,
     fetchedAt: Date.now(),
+    selectedLinkUrl: 'https://contacts.google.com',
   };
+}
+
+export async function fetchCalendarMeetMeetings(): Promise<WorkspaceFeedItem[]> {
+  const token = cachedAccessToken;
+  if (!token) return [];
+  const nowIso = encodeURIComponent(new Date().toISOString());
+  const data = await fetchGoogleJson<{
+    items?: Array<{
+      summary?: string;
+      hangoutLink?: string;
+      htmlLink?: string;
+      start?: {dateTime?: string; date?: string};
+    }>;
+  }>(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${nowIso}&maxResults=10&singleEvents=true&orderBy=startTime`,
+    token
+  );
+
+  return (data.items ?? [])
+    .filter((ev) => Boolean(ev.hangoutLink))
+    .map((ev) => {
+      const startRaw = ev.start?.dateTime || ev.start?.date || '';
+      const when = startRaw ? new Date(startRaw).toLocaleString() : 'Upcoming';
+      return {
+        title: ev.summary || 'Google Meet Video Call',
+        detail: ev.hangoutLink || '',
+        meta: when,
+        linkUrl: ev.hangoutLink || ev.htmlLink || 'https://meet.google.com',
+      };
+    });
 }

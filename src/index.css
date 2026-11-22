@@ -249,3 +249,117 @@ button {
   opacity: 0.08;
 }
 
+.vr-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 6, 23, 0.78);
+  backdrop-filter: blur(10px);
+  padding: 20px;
+  pointer-events: auto;
+}
+
+.vr-modal-card {
+  width: min(860px, 94vw);
+  background: rgba(15, 23, 42, 0.96);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  border-radius: 18px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  color: #f8fafc;
+}
+
+.vr-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.vr-modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vr-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vr-modal-link,
+.vr-modal-close {
+  border-radius: 9999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: none;
+  text-decoration: none;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(30, 41, 59, 0.85);
+  color: #f8fafc;
+}
+
+.vr-modal-close {
+  border-color: rgba(244, 63, 94, 0.55);
+  background: rgba(244, 63, 94, 0.22);
+}
+
+.vr-modal-link:hover,
+.vr-modal-close:hover {
+  background: rgba(56, 189, 248, 0.28);
+  text-decoration: none;
+}
+
+.vr-modal-frame {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 0;
+  background: #000;
+}
+
+.vr-query-card {
+  width: min(520px, 92vw);
+  padding: 18px;
+  gap: 14px;
+}
+
+.vr-query-form {
+  display: flex;
+  gap: 10px;
+}
+
+.vr-query-input {
+  flex: 1;
+  border-radius: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(2, 6, 23, 0.85);
+  color: #f8fafc;
+  padding: 10px 14px;
+  font-size: 15px;
+  outline: none;
+}
+
+.vr-query-submit {
+  border-radius: 10px;
+  border: none;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: none;
+  background: #38bdf8;
+  color: #020617;
+}
+
+

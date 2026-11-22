@@ -4,12 +4,33 @@ import {SoundEngine} from '../audio/SoundEngine.ts';
 import {VRLoungeEnvironment} from '../environment/VRLoungeEnvironment.ts';
 import {SensorFusionTracker} from '../sensors/SensorFusionTracker.ts';
 import {
+  deviceHomeService,
+  DeviceStatusSnapshot,
+} from '../services/deviceHomeService.ts';
+import {
+  fetchLiveGoogleSuiteFeed,
+  getChromeInput,
+  getYouTubeSearchQuery,
+  pickRealDevicePhotos,
+  setChromeInput,
+  setYouTubeSearchQuery,
+} from '../services/googleAppsLiveService.ts';
+import {
   fetchGoogleWorkspaceFeed,
   getGoogleAuthSnapshot,
+  signInWithGoogle,
   subscribeGoogleAuth,
+  WorkspaceFeedItem,
   WorkspaceFeedResult,
 } from '../services/googleWorkspaceService.ts';
+import {PLAY_STORE_CATALOG} from '../store/catalog.ts';
 import {PlayableModeId, PlayStoreAppItem} from '../types.ts';
+import {
+  closeYouTubePlayerOverlay,
+  openExternalUrlSafely,
+  openLiveSearchPromptModal,
+  openYouTubePlayerOverlay,
+} from '../ui/youtubePlayerOverlay.ts';
 
 interface SpaceTarget {
   lod: THREE.LOD;
@@ -68,14 +89,38 @@ export class VRGameTheater extends xb.Script {
   private mode: 'hub' | PlayableModeId = 'hub';
   private score = 0;
   private highScore = 0;
+  private blasterHighScore = 0;
+  private racerHighScore = 0;
   private wave = 1;
   private cinemaPlaying = true;
   private cinemaDimmed = false;
 
-  // Google Workspace live API state
+  // Device Home Screen & Interactive Curved Screen state
+  private installedAppsProvider: (() => PlayStoreAppItem[]) | null = null;
+  private appLauncher: ((app: PlayStoreAppItem) => void) | null = null;
+  private homeAppPage = 0;
+  private mirrorAsWallpaper = false;
+  private screenHitboxes: Array<{
+    id: string;
+    label: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    onClick: () => void;
+  }> = [];
+  private hoveredScreenBoxId: string | null = null;
+  private readonly _hitLocalScratch = new THREE.Vector3();
+
+  // Google Workspace & Live Google Apps state
   private workspaceFeed: WorkspaceFeedResult | null = null;
   private workspaceLoading = false;
+  private selectedItemIndex = 0;
   private unsubAuth: (() => void) | null = null;
+  private imageCache = new Map<
+    string,
+    {img: HTMLImageElement; loaded: boolean; failed: boolean}
+  >();
 
   // Virtual Play Browser theater mirror state
   private browserState: {
@@ -263,11 +308,30 @@ export class VRGameTheater extends xb.Script {
     }
 
     this.unsubAuth = subscribeGoogleAuth((snap) => {
-      if (snap.signedIn && this.mode === 'google-workspace' && this.activeApp?.googleService) {
-        void this.refreshWorkspaceApp();
+      if (snap.signedIn && this.activeApp?.googleService) {
+        if (this.mode === 'google-workspace') {
+          void this.refreshWorkspaceApp();
+        } else if (this.mode === 'google-suite-launch' && this.activeApp.googleService === 'meet') {
+          void this.refreshGoogleSuiteApp();
+        }
       }
     });
 
+    this.drawScreen();
+  }
+
+  public setInstalledAppsProvider(provider: () => PlayStoreAppItem[]): void {
+    this.installedAppsProvider = provider;
+  }
+
+  public setAppLauncher(launcher: (app: PlayStoreAppItem) => void): void {
+    this.appLauncher = launcher;
+  }
+
+  public setHomeAppPage(page: number): void {
+    const apps = this.installedAppsProvider?.() ?? PLAY_STORE_CATALOG;
+    const totalPages = Math.max(1, Math.ceil(apps.length / 8));
+    this.homeAppPage = ((page % totalPages) + totalPages) % totalPages;
     this.drawScreen();
   }
 
@@ -314,6 +378,7 @@ export class VRGameTheater extends xb.Script {
     this.mode = app.playableMode;
     this.score = 0;
     this.wave = 1;
+    this.selectedItemIndex = 0;
     this.workspaceFeed = null;
     this.env.setAccentColor(app.accentColor);
 
@@ -342,6 +407,7 @@ export class VRGameTheater extends xb.Script {
     } else if (this.mode === 'google-suite-launch') {
       this.cinemaPlaying = true;
       this.env.setTheaterDim(0.65);
+      void this.refreshGoogleSuiteApp();
     } else if (this.mode === 'control-scheme') {
       this.env.setTheaterDim(0.35);
     } else {
@@ -351,6 +417,7 @@ export class VRGameTheater extends xb.Script {
     }
 
     this.sound.playInstallComplete();
+    this.drawScreen();
     this.onSessionChange?.(this.activeApp, this.score);
   }
 
@@ -416,10 +483,211 @@ export class VRGameTheater extends xb.Script {
     this.drawScreen();
     try {
       this.workspaceFeed = await fetchGoogleWorkspaceFeed(svc);
+      if (this.workspaceFeed.items.length > 0) {
+        this.selectedItemIndex = Math.min(
+          this.selectedItemIndex,
+          this.workspaceFeed.items.length - 1
+        );
+      } else {
+        this.selectedItemIndex = 0;
+      }
     } finally {
       this.workspaceLoading = false;
       this.drawScreen();
     }
+  }
+
+  async refreshGoogleSuiteApp(): Promise<void> {
+    const svc = this.activeApp?.googleService;
+    if (!svc) return;
+    this.workspaceLoading = true;
+    this.drawScreen();
+    try {
+      const heading = this.sensors.getTelemetry().compassHeadingDeg;
+      this.workspaceFeed = await fetchLiveGoogleSuiteFeed(svc, heading, {
+        blasterHigh: this.blasterHighScore,
+        racerHigh: this.racerHighScore,
+      });
+      if (this.workspaceFeed.items.length > 0) {
+        this.selectedItemIndex = Math.min(
+          this.selectedItemIndex,
+          this.workspaceFeed.items.length - 1
+        );
+      } else {
+        this.selectedItemIndex = 0;
+      }
+    } finally {
+      this.workspaceLoading = false;
+      this.drawScreen();
+    }
+  }
+
+  public refreshActiveGoogleApp(): void {
+    if (this.mode === 'google-workspace') {
+      void this.refreshWorkspaceApp();
+    } else if (this.mode === 'google-suite-launch') {
+      void this.refreshGoogleSuiteApp();
+    }
+  }
+
+  public cycleGoogleItem(delta: number): void {
+    const items = this.workspaceFeed?.items ?? [];
+    if (items.length === 0) return;
+    this.selectedItemIndex = (this.selectedItemIndex + delta + items.length) % items.length;
+    this.sound.playHoverTick();
+    this.drawScreen();
+  }
+
+  public getSelectedGoogleItem(): WorkspaceFeedItem | null {
+    const items = this.workspaceFeed?.items ?? [];
+    if (items.length === 0) return null;
+    return items[Math.min(this.selectedItemIndex, items.length - 1)] ?? null;
+  }
+
+  public async triggerGooglePrimaryAction(): Promise<void> {
+    const svc = this.activeApp?.googleService;
+    const item = this.getSelectedGoogleItem();
+
+    if (this.mode === 'google-workspace' && this.workspaceFeed?.requiresAuth) {
+      this.sound.playClick();
+      void signInWithGoogle().catch(() => {});
+      return;
+    }
+
+    if ((svc === 'youtube' || svc === 'google-tv') && item?.videoId) {
+      this.sound.playClick();
+      openYouTubePlayerOverlay(item.videoId, item.title);
+      return;
+    }
+
+    if (svc === 'photos') {
+      this.sound.playClick();
+      await pickRealDevicePhotos();
+      await this.refreshGoogleSuiteApp();
+      return;
+    }
+
+    if (svc === 'play-games' && item) {
+      const match = (this.installedAppsProvider?.() ?? PLAY_STORE_CATALOG).find(
+        (a) => a.title.toLowerCase() === item.title.toLowerCase()
+      );
+      if (match && this.appLauncher) {
+        this.sound.playClick();
+        this.appLauncher(match);
+        return;
+      }
+    }
+
+    const targetUrl =
+      item?.linkUrl ||
+      this.workspaceFeed?.selectedLinkUrl ||
+      this.activeApp?.webUrl ||
+      this.activeApp?.playStoreUrl;
+
+    if (targetUrl) {
+      this.sound.playClick();
+      openExternalUrlSafely(targetUrl);
+    } else {
+      this.openActiveGoogleAppExternally();
+    }
+  }
+
+  public promptLiveSearchForActiveApp(): void {
+    const svc = this.activeApp?.googleService;
+    if (svc === 'youtube' || svc === 'google-tv') {
+      openLiveSearchPromptModal({
+        title: svc === 'google-tv' ? 'Search Google TV' : 'Search YouTube in VR',
+        placeholder: 'Search videos, channels, 360 VR...',
+        initialValue: getYouTubeSearchQuery(),
+        onSubmit: (q) => {
+          setYouTubeSearchQuery(q);
+          void this.refreshGoogleSuiteApp();
+        },
+      });
+    } else {
+      openLiveSearchPromptModal({
+        title: 'Google Chrome VR — Search or Enter URL',
+        placeholder: 'Search Google news or paste https://...',
+        initialValue: getChromeInput(),
+        onSubmit: (q) => {
+          setChromeInput(q);
+          const chromeApp =
+            (this.installedAppsProvider?.() ?? PLAY_STORE_CATALOG).find(
+              (a) => a.id === 'google-chrome'
+            ) ?? PLAY_STORE_CATALOG.find((a) => a.id === 'google-chrome');
+          if (this.activeApp?.googleService !== 'chrome' && chromeApp) {
+            this.launchApp(chromeApp);
+          } else {
+            void this.refreshGoogleSuiteApp();
+          }
+        },
+      });
+    }
+  }
+
+  public screenPointToLogicalXY(worldPoint: THREE.Vector3): {px: number; py: number} | null {
+    const mesh = this.env.screenMesh;
+    if (!mesh) return null;
+    mesh.updateMatrixWorld();
+    mesh.worldToLocal(this._hitLocalScratch.copy(worldPoint));
+    const x = this._hitLocalScratch.x;
+    const y = this._hitLocalScratch.y;
+    const z = this._hitLocalScratch.z;
+    const u = THREE.MathUtils.clamp((Math.atan2(x, -z) + 0.46) / 0.92, 0, 1);
+    const v = THREE.MathUtils.clamp(0.5 - y / 1.65, 0, 1);
+    return {px: u * LOGICAL_W, py: v * LOGICAL_H};
+  }
+
+  public updateScreenHover(worldPoint: THREE.Vector3 | null): {id: string; label: string} | null {
+    if (!worldPoint || this.screenHitboxes.length === 0) {
+      if (this.hoveredScreenBoxId !== null) {
+        this.hoveredScreenBoxId = null;
+        this.drawScreen();
+      }
+      return null;
+    }
+    const coords = this.screenPointToLogicalXY(worldPoint);
+    if (!coords) return null;
+
+    let hitBox: (typeof this.screenHitboxes)[number] | null = null;
+    for (let i = this.screenHitboxes.length - 1; i >= 0; i--) {
+      const b = this.screenHitboxes[i];
+      if (
+        coords.px >= b.x &&
+        coords.px <= b.x + b.w &&
+        coords.py >= b.y &&
+        coords.py <= b.y + b.h
+      ) {
+        hitBox = b;
+        break;
+      }
+    }
+
+    const nextId = hitBox?.id ?? null;
+    if (nextId !== this.hoveredScreenBoxId) {
+      this.hoveredScreenBoxId = nextId;
+      this.drawScreen();
+    }
+    return hitBox ? {id: hitBox.id, label: hitBox.label} : null;
+  }
+
+  public handleScreenClickAt(worldPoint: THREE.Vector3): boolean {
+    const coords = this.screenPointToLogicalXY(worldPoint);
+    if (!coords) return false;
+    for (let i = this.screenHitboxes.length - 1; i >= 0; i--) {
+      const b = this.screenHitboxes[i];
+      if (
+        coords.px >= b.x &&
+        coords.px <= b.x + b.w &&
+        coords.py >= b.y &&
+        coords.py <= b.y + b.h
+      ) {
+        this.sound.playClick();
+        b.onClick();
+        return true;
+      }
+    }
+    return false;
   }
 
   openActiveGoogleAppExternally(): void {
@@ -427,27 +695,25 @@ export class VRGameTheater extends xb.Script {
     const isAndroid = /Android/i.test(navigator.userAgent);
     const url = isAndroid
       ? `intent://#Intent;package=${this.activeApp.packageId};end`
-      : this.activeApp.webUrl || this.activeApp.playStoreUrl;
+      : this.workspaceFeed?.selectedLinkUrl || this.activeApp.webUrl || this.activeApp.playStoreUrl;
 
-    const a = document.createElement('a');
-    a.href = url;
-    if (!url.startsWith('intent://')) {
-      a.target = '_blank';
-    }
-    a.rel = 'noopener noreferrer';
-    a.click();
+    openExternalUrlSafely(url);
     this.sound.playClick();
   }
 
   exitToHub(): void {
+    closeYouTubePlayerOverlay();
     this.stopCurrentGame();
     this.activeApp = null;
     this.workspaceFeed = null;
     this.workspaceLoading = false;
+    this.selectedItemIndex = 0;
+    this.hoveredScreenBoxId = null;
     this.mode = 'hub';
     this.env.setTheaterDim(0);
     this.env.setAccentColor('#38bdf8');
     this.sound.playClick();
+    this.drawScreen();
     this.onSessionChange?.(null, 0);
   }
 
@@ -728,13 +994,18 @@ export class VRGameTheater extends xb.Script {
       this.updateNeonRacer(dt);
     }
 
+    const mirrorLive = this.mode === 'hub' && deviceHomeService.isScreenMirrorActive();
     const maxGameInterval = 1 / this.screenRedrawHz;
-    const redrawInterval =
-      this.mode === 'google-workspace' ||
-      this.mode === 'control-scheme' ||
-      this.mode === 'play-browser'
-        ? Math.max(0.2, maxGameInterval)
-        : maxGameInterval;
+    const redrawInterval = mirrorLive
+      ? maxGameInterval
+      : this.mode === 'google-workspace' ||
+          this.mode === 'google-suite-launch' ||
+          this.mode === 'control-scheme' ||
+          this.mode === 'play-browser'
+        ? Math.max(0.25, maxGameInterval)
+        : this.mode === 'hub'
+          ? Math.max(0.18, maxGameInterval)
+          : maxGameInterval;
     this.drawTimer += dt;
     if (this.drawTimer >= redrawInterval) {
       this.drawTimer = 0;
@@ -858,6 +1129,7 @@ export class VRGameTheater extends xb.Script {
           this.activeTargetCount = Math.max(0, this.activeTargetCount - 1);
           this.score += 100;
           if (this.score > this.highScore) this.highScore = this.score;
+          if (this.score > this.blasterHighScore) this.blasterHighScore = this.score;
           this.sound.playExplosion();
           this.onSessionChange?.(this.activeApp, this.score);
           hit = true;
@@ -965,6 +1237,7 @@ export class VRGameTheater extends xb.Script {
             this.sound.playExplosion();
           }
           if (this.score > this.highScore) this.highScore = this.score;
+          if (this.score > this.racerHighScore) this.racerHighScore = this.score;
           this.onSessionChange?.(this.activeApp, this.score);
           obs.active = false;
           continue;
@@ -973,6 +1246,7 @@ export class VRGameTheater extends xb.Script {
       if (obs.z > 1.05) {
         this.score += 10;
         if (this.score > this.highScore) this.highScore = this.score;
+        if (this.score > this.racerHighScore) this.racerHighScore = this.score;
         obs.active = false;
       }
     }
@@ -997,9 +1271,76 @@ export class VRGameTheater extends xb.Script {
     return g;
   }
 
+  private getCachedImage(url?: string): HTMLImageElement | null {
+    if (!url) return null;
+    const entry = this.imageCache.get(url);
+    if (entry) {
+      return entry.loaded && !entry.failed ? entry.img : null;
+    }
+    if (this.imageCache.size >= 24) {
+      const oldestKey = this.imageCache.keys().next().value;
+      if (oldestKey) this.imageCache.delete(oldestKey);
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const record = {img, loaded: false, failed: false};
+    img.onload = () => {
+      record.loaded = true;
+      this.drawScreen();
+    };
+    img.onerror = () => {
+      record.failed = true;
+    };
+    img.src = url;
+    this.imageCache.set(url, record);
+    return null;
+  }
+
+  private addScreenHitbox(
+    id: string,
+    label: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    onClick: () => void
+  ): void {
+    this.screenHitboxes.push({id, label, x, y, w, h, onClick});
+  }
+
+  private drawRoundedBox(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    r: number,
+    fill: string,
+    stroke?: string,
+    lineWidth = 1.5
+  ): void {
+    const rad = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rad);
+    ctx.arcTo(x + w, y + h, x, y + h, rad);
+    ctx.arcTo(x, y + h, x, y, rad);
+    ctx.arcTo(x, y, x + w, y, rad);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+    }
+  }
+
   private drawScreen(): void {
     const ctx = this.ctx;
     if (!ctx) return;
+
+    this.screenHitboxes.length = 0;
 
     // Draw using logical 1024x512 coordinates scaled cleanly to the active Eco/Balanced/High canvas
     ctx.setTransform(this.canvasScale, 0, 0, this.canvasScale, 0, 0);
@@ -1012,10 +1353,8 @@ export class VRGameTheater extends xb.Script {
       this.drawBlasterScreen(ctx, W, H);
     } else if (this.mode === 'neon-racer') {
       this.drawRacerScreen(ctx, W, H);
-    } else if (this.mode === 'google-workspace') {
-      this.drawGoogleWorkspaceScreen(ctx, W, H);
-    } else if (this.mode === 'google-suite-launch') {
-      this.drawGoogleSuiteLaunchScreen(ctx, W, H);
+    } else if (this.mode === 'google-workspace' || this.mode === 'google-suite-launch') {
+      this.drawLiveGoogleAppScreen(ctx, W, H);
     } else if (this.mode === 'control-scheme') {
       this.drawControlSchemeScreen(ctx, W, H);
     } else if (this.mode === 'play-browser') {
@@ -1027,70 +1366,403 @@ export class VRGameTheater extends xb.Script {
     this.screenTexture.needsUpdate = true;
   }
 
+  private drawDeviceStatusBar(
+    ctx: CanvasRenderingContext2D,
+    W: number,
+    dev: DeviceStatusSnapshot
+  ): void {
+    const auth = getGoogleAuthSnapshot();
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    const dateStr = now.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric'});
+
+    ctx.fillStyle = 'rgba(2, 6, 23, 0.78)';
+    ctx.fillRect(0, 0, W, 44);
+    ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+    ctx.fillRect(0, 43, W, 1.5);
+
+    // Left: Real device model + OS
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(
+      `${dev.deviceModel} • ${dev.platformLabel} (${dev.resolutionLabel})`,
+      22,
+      27
+    );
+
+    // Center: Real system clock + date
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${timeStr}  •  ${dateStr}`, W / 2, 27);
+
+    // Right: Network, Battery, Google Auth pill
+    const batStr =
+      dev.batteryPct !== null
+        ? `${dev.batteryCharging ? '⚡' : ''}${dev.batteryPct}%`
+        : `${dev.cpuCores}c`;
+    const netStr = dev.online ? dev.networkLabel : 'OFFLINE';
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = dev.online ? '#34d399' : '#fb7185';
+    ctx.font = 'bold 15px monospace';
+    ctx.fillText(`${netStr}  |  BAT ${batStr}`, W - 210, 27);
+
+    const authId = 'home-auth';
+    const hovered = this.hoveredScreenBoxId === authId;
+    const authText = auth.signedIn ? auth.userEmail.split('@')[0] : 'Google Sign-In';
+    this.drawRoundedBox(
+      ctx,
+      W - 196,
+      7,
+      178,
+      30,
+      15,
+      auth.signedIn ? 'rgba(16, 185, 129, 0.22)' : 'rgba(56, 189, 248, 0.22)',
+      hovered ? '#ffffff' : auth.signedIn ? '#34d399' : '#38bdf8',
+      hovered ? 2 : 1.2
+    );
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(authText.slice(0, 18), W - 107, 27);
+    this.addScreenHitbox(
+      authId,
+      auth.signedIn ? 'Open Gmail Live' : 'Sign in with Google',
+      W - 196,
+      7,
+      178,
+      30,
+      () => {
+        if (auth.signedIn) {
+          const gmail = (this.installedAppsProvider?.() ?? PLAY_STORE_CATALOG).find(
+            (a) => a.id === 'google-gmail'
+          );
+          if (gmail && this.appLauncher) this.appLauncher(gmail);
+        } else {
+          void signInWithGoogle().catch(() => {});
+        }
+      }
+    );
+  }
+
   private drawHubScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+    const dev = deviceHomeService.getSnapshot();
+    const tel = this.sensors.getTelemetry();
+    const mirrorVideo = deviceHomeService.getMirrorVideo();
+    const mirrorLive = Boolean(dev.screenMirrorActive && mirrorVideo && mirrorVideo.readyState >= 2);
+
     ctx.fillStyle = this.getCachedGradient(ctx, 'hub', 0, 0, W, H, [
-      [0, '#070d1f'],
-      [0.5, '#0f172a'],
-      [1, '#1e1b4b'],
+      [0, '#04091a'],
+      [0.5, '#0b1633'],
+      [1, '#1b1444'],
     ]);
     ctx.fillRect(0, 0, W, H);
 
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.1)';
+    // Subtle wallpaper grid
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.08)';
     ctx.lineWidth = 1;
-    for (let y = 0; y < H; y += 32) {
+    for (let y = 44; y < H; y += 36) {
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(W, y);
       ctx.stroke();
     }
 
-    const tel = this.sensors.getTelemetry();
-    const auth = getGoogleAuthSnapshot();
+    // Full-screen Device Screen Mirroring view (when active and not in wallpaper mode)
+    if (mirrorLive && mirrorVideo && !this.mirrorAsWallpaper) {
+      this.drawDeviceStatusBar(ctx, W, dev);
+      const vw = mirrorVideo.videoWidth || 16;
+      const vh = mirrorVideo.videoHeight || 9;
+      const areaX = 16;
+      const areaY = 52;
+      const areaW = W - 32;
+      const areaH = H - 108;
+      const scale = Math.min(areaW / vw, areaH / vh);
+      const dw = vw * scale;
+      const dh = vh * scale;
+      const dx = areaX + (areaW - dw) / 2;
+      const dy = areaY + (areaH - dh) / 2;
 
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(areaX, areaY, areaW, areaH);
+      ctx.drawImage(mirrorVideo, dx, dy, dw, dh);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(dx, dy, dw, dh);
+
+      // Mirror Controls Bar
+      const toggleWallpaperId = 'mirror-wallpaper';
+      this.drawRoundedBox(
+        ctx,
+        24,
+        H - 46,
+        260,
+        36,
+        10,
+        'rgba(30, 41, 59, 0.92)',
+        this.hoveredScreenBoxId === toggleWallpaperId ? '#ffffff' : '#38bdf8',
+        1.8
+      );
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = 'bold 15px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Show Apps Over Mirror', 154, H - 23);
+      this.addScreenHitbox(toggleWallpaperId, 'Overlay Home Apps', 24, H - 46, 260, 36, () => {
+        this.mirrorAsWallpaper = true;
+        this.drawScreen();
+      });
+
+      const stopMirrorId = 'mirror-stop';
+      this.drawRoundedBox(
+        ctx,
+        W - 244,
+        H - 46,
+        220,
+        36,
+        10,
+        'rgba(225, 29, 72, 0.35)',
+        this.hoveredScreenBoxId === stopMirrorId ? '#ffffff' : '#fb7185',
+        1.8
+      );
+      ctx.fillStyle = '#ffe4e6';
+      ctx.fillText('Stop Device Mirror', W - 134, H - 23);
+      this.addScreenHitbox(stopMirrorId, 'Stop Device Screen Mirror', W - 244, H - 46, 220, 36, () => {
+        deviceHomeService.stopDeviceScreenMirror();
+        this.mirrorAsWallpaper = false;
+        this.drawScreen();
+      });
+      return;
+    }
+
+    // Mirror active as live translucent wallpaper behind Device Home Screen icons
+    if (mirrorLive && mirrorVideo && this.mirrorAsWallpaper) {
+      ctx.save();
+      ctx.globalAlpha = 0.28;
+      ctx.drawImage(mirrorVideo, 0, 44, W, H - 44);
+      ctx.restore();
+    }
+
+    this.drawDeviceStatusBar(ctx, W, dev);
+
+    // Quick Action Row: Search Bar + Mirror Screen + Pagination
+    const searchId = 'home-search';
+    this.drawRoundedBox(
+      ctx,
+      24,
+      56,
+      368,
+      44,
+      22,
+      'rgba(15, 23, 42, 0.9)',
+      this.hoveredScreenBoxId === searchId ? '#ffffff' : 'rgba(56, 189, 248, 0.5)',
+      2
+    );
     ctx.fillStyle = '#38bdf8';
-    ctx.font = 'bold 22px sans-serif';
+    ctx.font = 'bold 19px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText('POCKETVR PLAY HUB  //  ALL GOOGLE APPS PRE-INSTALLED', 54, 58);
-
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = 'bold 48px sans-serif';
-    ctx.fillText('Sensor-Controlled Android VR', 54, 128);
-
+    ctx.fillText('G', 44, 84);
     ctx.fillStyle = '#cbd5e1';
-    ctx.font = '23px sans-serif';
-    ctx.fillText('• LOOK AT ANY BUTTON (1.0s Dwell), HEAD NOD, or TAP HEADSET to Click', 54, 188);
-    ctx.fillText('• TILT HEAD LEFT/RIGHT while gazing list to Scroll 16+ Google & VR Apps', 54, 226);
-    ctx.fillText('• SHAKE HEAD LEFT-RIGHT to Exit back to Hub  •  LOOK DOWN 1.2s to Recenter', 54, 264);
+    ctx.font = '16px sans-serif';
+    ctx.fillText('Search Google Web or Open Chrome...', 72, 83);
+    this.addScreenHitbox(searchId, 'Search Google / Chrome', 24, 56, 368, 44, () => {
+      this.promptLiveSearchForActiveApp();
+    });
 
-    ctx.fillStyle = auth.signedIn ? '#34d399' : '#fbbf24';
-    ctx.font = 'bold 21px sans-serif';
+    const mirrorId = 'home-mirror';
+    this.drawRoundedBox(
+      ctx,
+      406,
+      56,
+      250,
+      44,
+      14,
+      mirrorLive ? 'rgba(16, 185, 129, 0.28)' : 'rgba(56, 189, 248, 0.2)',
+      this.hoveredScreenBoxId === mirrorId ? '#ffffff' : mirrorLive ? '#34d399' : '#38bdf8',
+      2
+    );
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.textAlign = 'center';
     ctx.fillText(
-      auth.signedIn
-        ? `✓ Google Connected (${auth.userEmail}) — Launch Gmail, Drive, Calendar & Docs!`
-        : '★ Sign in with Google (top-right or Play Store panel) for live Gmail, Drive & Calendar',
-      54,
-      325
+      mirrorLive ? '📺 Fullscreen Mirror' : '📺 Mirror Real Screen',
+      531,
+      83
+    );
+    this.addScreenHitbox(
+      mirrorId,
+      mirrorLive ? 'Fullscreen Mirrored Device Screen' : 'Mirror Your Device Screen into VR',
+      406,
+      56,
+      250,
+      44,
+      () => {
+        if (mirrorLive) {
+          this.mirrorAsWallpaper = false;
+          this.drawScreen();
+        } else {
+          void deviceHomeService.toggleDeviceScreenMirror().then(() => {
+            this.mirrorAsWallpaper = false;
+            this.drawScreen();
+          });
+        }
+      }
     );
 
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-    ctx.fillRect(54, 380, W - 108, 86);
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(54, 380, W - 108, 86);
+    const installedApps = this.installedAppsProvider?.() ?? PLAY_STORE_CATALOG;
+    const pageSize = 8;
+    const totalPages = Math.max(1, Math.ceil(installedApps.length / pageSize));
+    if (this.homeAppPage >= totalPages) this.homeAppPage = 0;
 
+    const prevId = 'home-prev';
+    this.drawRoundedBox(
+      ctx,
+      670,
+      56,
+      96,
+      44,
+      12,
+      'rgba(30, 41, 59, 0.9)',
+      this.hoveredScreenBoxId === prevId ? '#ffffff' : '#64748b',
+      1.6
+    );
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText('◀ Prev', 718, 83);
+    this.addScreenHitbox(prevId, 'Previous App Page', 670, 56, 96, 44, () => {
+      this.setHomeAppPage(this.homeAppPage - 1);
+    });
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText(`HOME ${this.homeAppPage + 1}/${totalPages}`, 832, 83);
+
+    const nextId = 'home-next';
+    this.drawRoundedBox(
+      ctx,
+      898,
+      56,
+      102,
+      44,
+      12,
+      'rgba(30, 41, 59, 0.9)',
+      this.hoveredScreenBoxId === nextId ? '#ffffff' : '#64748b',
+      1.6
+    );
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText('Next ▶', 949, 83);
+    this.addScreenHitbox(nextId, 'Next App Page', 898, 56, 102, 44, () => {
+      this.setHomeAppPage(this.homeAppPage + 1);
+    });
+
+    // 4x2 Interactive Device Home App Grid
+    const startIdx = this.homeAppPage * pageSize;
+    const pageApps = installedApps.slice(startIdx, startIdx + pageSize);
+    const cols = 4;
+    const cardW = 228;
+    const cardH = 152;
+    const gapX = 16;
+    const gapY = 16;
+    const gridX = 24;
+    const gridY = 114;
+
+    for (let i = 0; i < pageApps.length; i++) {
+      const app = pageApps[i];
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = gridX + col * (cardW + gapX);
+      const y = gridY + row * (cardH + gapY);
+      const boxId = `home-app-${app.id}`;
+      const isHovered = this.hoveredScreenBoxId === boxId;
+
+      this.drawRoundedBox(
+        ctx,
+        x,
+        y,
+        cardW,
+        cardH,
+        16,
+        isHovered ? 'rgba(30, 58, 138, 0.92)' : 'rgba(15, 23, 42, 0.88)',
+        isHovered ? '#ffffff' : app.accentColor,
+        isHovered ? 3 : 1.8
+      );
+
+      // Top accent strip
+      ctx.fillStyle = app.accentColor;
+      ctx.fillRect(x + 14, y + 12, 48, 6);
+
+      // App initial glyph badge
+      this.drawRoundedBox(ctx, x + 14, y + 26, 46, 46, 12, app.accentColor);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(app.title.slice(0, 2).toUpperCase(), x + 37, y + 57);
+
+      // Badge pill
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
+      ctx.fillRect(x + 70, y + 28, 142, 22);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(app.badge.slice(0, 18), x + 78, y + 43);
+
+      // Developer
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px sans-serif';
+      ctx.fillText(app.developer.slice(0, 22), x + 70, y + 66);
+
+      // App Title
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 19px sans-serif';
+      ctx.fillText(app.title.slice(0, 19), x + 14, y + 104);
+
+      // Footer hint
+      ctx.fillStyle = isHovered ? '#34d399' : '#38bdf8';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillText(
+        isHovered ? '▶ GAZE / CLICK TO LAUNCH' : `★ ${app.rating}  •  INSTALLED`,
+        x + 14,
+        y + 134
+      );
+
+      this.addScreenHitbox(boxId, `Device App: ${app.title}`, x, y, cardW, cardH, () => {
+        if (this.appLauncher) {
+          this.appLauncher(app);
+        } else {
+          this.launchApp(app);
+        }
+      });
+    }
+
+    // Bottom Live Device OS & Sensor Strip
+    this.drawRoundedBox(
+      ctx,
+      24,
+      H - 52,
+      W - 48,
+      40,
+      10,
+      'rgba(15, 23, 42, 0.9)',
+      'rgba(56, 189, 248, 0.4)',
+      1.4
+    );
     ctx.fillStyle = '#38bdf8';
-    ctx.font = 'bold 20px sans-serif';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'left';
     ctx.fillText(
-      `SENSORS: ${tel.statusLabel.toUpperCase()}  •  MOTION: ${tel.locomotion.state.toUpperCase()} (${tel.locomotion.stepCount} STEPS)`,
-      78,
-      415
+      `DEVICE HOME (${installedApps.length} APPS)  •  SENSORS: ${tel.statusLabel.toUpperCase()}  •  MOTION: ${tel.locomotion.state.toUpperCase()} (${tel.locomotion.stepCount} STEPS)`,
+      42,
+      H - 27
     );
     ctx.fillStyle = '#e2e8f0';
-    ctx.font = '20px monospace';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'right';
     ctx.fillText(
-      `COMPASS: ${tel.compassHeadingDeg}°   YAW: ${tel.yawDeg}°   PITCH: ${tel.pitchDeg}°   CADENCE: ${tel.locomotion.cadenceSpm} SPM`,
-      78,
-      448
+      `COMPASS ${tel.compassHeadingDeg}°  YAW ${tel.yawDeg}°  PITCH ${tel.pitchDeg}°`,
+      W - 42,
+      H - 27
     );
   }
 
@@ -1152,176 +1824,489 @@ export class VRGameTheater extends xb.Script {
     );
   }
 
-  private drawGoogleWorkspaceScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+  private wrapCanvasLines(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    maxWidth: number,
+    maxLines: number
+  ): string[] {
+    const rawParas = text.split('\n');
+    const out: string[] = [];
+    for (const para of rawParas) {
+      const words = para.trim().split(/\s+/);
+      let line = '';
+      for (const word of words) {
+        const candidate = line ? `${line} ${word}` : word;
+        if (line && ctx.measureText(candidate).width > maxWidth) {
+          out.push(line);
+          line = word;
+          if (out.length >= maxLines) return out;
+        } else {
+          line = candidate;
+        }
+      }
+      if (line) {
+        out.push(line);
+        if (out.length >= maxLines) return out;
+      }
+    }
+    return out;
+  }
+
+  private drawLiveGoogleAppScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
     const accent = this.activeApp?.accentColor || '#4285F4';
+    const svc = this.activeApp?.googleService;
     const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, '#090f21');
+    grad.addColorStop(0, '#070c1b');
     grad.addColorStop(1, '#111827');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, W, H);
 
     // Top Google accent stripe
     ctx.fillStyle = accent;
-    ctx.fillRect(0, 0, W, 10);
+    ctx.fillRect(0, 0, W, 8);
 
+    // Header Title + Live Subtitle
     ctx.fillStyle = accent;
-    ctx.font = 'bold 20px sans-serif';
+    ctx.font = 'bold 16px sans-serif';
     ctx.textAlign = 'left';
     ctx.fillText(
-      `GOOGLE APP (PRE-INSTALLED)  •  ${this.activeApp?.packageId ?? ''}`,
-      48,
-      54
+      `GOOGLE LIVE APP  •  ${this.activeApp?.packageId ?? ''}`,
+      36,
+      36
     );
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 42px sans-serif';
-    ctx.fillText(this.activeApp?.title ?? 'Google Workspace', 48, 106);
+    ctx.font = 'bold 34px sans-serif';
+    ctx.fillText(this.activeApp?.title ?? 'Google App', 36, 74);
+
+    // Interactive Top Action Buttons
+    const actionBtns: Array<{
+      id: string;
+      label: string;
+      fill: string;
+      border: string;
+      onClick: () => void;
+    }> = [];
+
+    const feed = this.workspaceFeed;
+    const items = feed?.items ?? [];
+    const selectedItem = items[Math.min(this.selectedItemIndex, Math.max(0, items.length - 1))];
+
+    if (items.length > 1) {
+      actionBtns.push({
+        id: 'g-prev',
+        label: '◀ Prev',
+        fill: 'rgba(30, 41, 59, 0.92)',
+        border: '#64748b',
+        onClick: () => this.cycleGoogleItem(-1),
+      });
+      actionBtns.push({
+        id: 'g-next',
+        label: 'Next ▶',
+        fill: 'rgba(30, 41, 59, 0.92)',
+        border: '#64748b',
+        onClick: () => this.cycleGoogleItem(1),
+      });
+    }
+
+    if (svc === 'youtube' || svc === 'google-tv' || svc === 'chrome') {
+      actionBtns.push({
+        id: 'g-search',
+        label: 'Search',
+        fill: 'rgba(56, 189, 248, 0.22)',
+        border: '#38bdf8',
+        onClick: () => this.promptLiveSearchForActiveApp(),
+      });
+    }
+
+    if (svc === 'photos') {
+      actionBtns.push({
+        id: 'g-pick-photos',
+        label: 'Pick Photos',
+        fill: 'rgba(251, 191, 36, 0.24)',
+        border: '#fbbf24',
+        onClick: () => {
+          void pickRealDevicePhotos().then(() => this.refreshGoogleSuiteApp());
+        },
+      });
+    } else if ((svc === 'youtube' || svc === 'google-tv') && selectedItem?.videoId) {
+      actionBtns.push({
+        id: 'g-watch',
+        label: '▶ Watch Video',
+        fill: 'rgba(239, 68, 68, 0.35)',
+        border: '#f87171',
+        onClick: () => void this.triggerGooglePrimaryAction(),
+      });
+    } else if (this.mode === 'google-workspace' && feed?.requiresAuth) {
+      actionBtns.push({
+        id: 'g-signin',
+        label: 'Sign in Google',
+        fill: 'rgba(52, 211, 153, 0.25)',
+        border: '#34d399',
+        onClick: () => {
+          void signInWithGoogle().catch(() => {});
+        },
+      });
+    } else {
+      actionBtns.push({
+        id: 'g-open',
+        label: 'Open App',
+        fill: 'rgba(52, 211, 153, 0.22)',
+        border: '#34d399',
+        onClick: () => void this.triggerGooglePrimaryAction(),
+      });
+    }
+
+    actionBtns.push({
+      id: 'g-sync',
+      label: '↻ Sync',
+      fill: 'rgba(30, 41, 59, 0.92)',
+      border: '#38bdf8',
+      onClick: () => this.refreshActiveGoogleApp(),
+    });
+    actionBtns.push({
+      id: 'g-home',
+      label: '⌂ Home',
+      fill: 'rgba(225, 29, 72, 0.28)',
+      border: '#fb7185',
+      onClick: () => this.exitToHub(),
+    });
+
+    let bx = W - 28;
+    for (let i = actionBtns.length - 1; i >= 0; i--) {
+      const b = actionBtns[i];
+      const bw = Math.max(84, b.label.length * 10 + 24);
+      bx -= bw;
+      const hovered = this.hoveredScreenBoxId === b.id;
+      this.drawRoundedBox(
+        ctx,
+        bx,
+        24,
+        bw,
+        36,
+        10,
+        b.fill,
+        hovered ? '#ffffff' : b.border,
+        hovered ? 2.4 : 1.5
+      );
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(b.label, bx + bw / 2, 47);
+      this.addScreenHitbox(b.id, b.label, bx, 24, bw, 36, b.onClick);
+      bx -= 8;
+    }
 
     if (this.workspaceLoading) {
       ctx.fillStyle = '#38bdf8';
-      ctx.font = 'bold 28px sans-serif';
-      ctx.fillText('Syncing live Google data into VR Theater...', 48, 220);
+      ctx.font = 'bold 26px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(`Loading live ${this.activeApp?.title ?? 'Google'} data into VR Theater...`, 36, 175);
       return;
     }
 
-    const feed = this.workspaceFeed;
-    if (!feed || feed.requiresAuth) {
-      ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
-      ctx.fillRect(48, 148, W - 96, 250);
-      ctx.strokeStyle = '#fbbf24';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(48, 148, W - 96, 250);
-
+    if (!feed || (this.mode === 'google-workspace' && feed.requiresAuth)) {
+      this.drawRoundedBox(ctx, 36, 120, W - 72, 280, 16, 'rgba(30, 41, 59, 0.92)', '#fbbf24', 2);
       ctx.fillStyle = '#fbbf24';
-      ctx.font = 'bold 30px sans-serif';
-      ctx.fillText('Sign in with Google to view live content', 78, 208);
-
+      ctx.font = 'bold 28px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('Sign in with Google to stream live personal data', 66, 178);
       ctx.fillStyle = '#e2e8f0';
+      ctx.font = '20px sans-serif';
+      ctx.fillText(
+        `Gaze/click "Sign in Google" above or top-right to authorize ${this.activeApp?.title ?? 'Workspace'}.`,
+        66,
+        228
+      );
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '18px sans-serif';
+      ctx.fillText(
+        'Streams live Gmail messages, Drive files, Calendar events, Docs, Sheets, Slides, Tasks & Contacts.',
+        66,
+        274
+      );
+      return;
+    }
+
+    if (feed.error) {
+      ctx.fillStyle = '#fb7185';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('Live Service Notice:', 36, 130);
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = '19px sans-serif';
+      ctx.fillText(feed.error.slice(0, 92), 36, 166);
+      return;
+    }
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '17px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(feed.subtitle.slice(0, 96), 36, 102);
+
+    // Split View: Left Interactive Item List (480px) + Right Rich Live Preview (460px)
+    const listX = 36;
+    const listW = 472;
+    const previewX = 526;
+    const previewY = 122;
+    const previewW = W - previewX - 36;
+    const previewH = H - previewY - 46;
+
+    const visibleItems = items.slice(0, 5);
+    if (visibleItems.length === 0) {
+      ctx.fillStyle = '#cbd5e1';
       ctx.font = '22px sans-serif';
       ctx.fillText(
-        `Use the "Sign in with Google" button (top-right or Play Store card) to`,
-        78,
-        262
+        svc === 'photos'
+          ? 'No photos selected yet. Click "Pick Photos" above to view your real gallery!'
+          : 'No items returned right now. Click "Sync" or "Open App" above.',
+        listX,
+        180
       );
-      ctx.fillText(
-        `authorize read access for ${this.activeApp?.title ?? 'Google Apps'}.`,
-        78,
-        296
-      );
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '20px sans-serif';
-      ctx.fillText(
-        'Once signed in, your real inbox, files, events, or tasks will stream here.',
-        78,
-        352
-      );
-    } else if (feed.error) {
-      ctx.fillStyle = '#fb7185';
-      ctx.font = 'bold 24px sans-serif';
-      ctx.fillText('Workspace Notice:', 48, 175);
-      ctx.fillStyle = '#f8fafc';
-      ctx.font = '21px sans-serif';
-      ctx.fillText(feed.error.slice(0, 88), 48, 215);
     } else {
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '20px sans-serif';
-      ctx.fillText(feed.subtitle, 48, 142);
+      let y = 122;
+      for (let i = 0; i < visibleItems.length; i++) {
+        const item = visibleItems[i];
+        const isSelected = i === this.selectedItemIndex;
+        const rowId = `g-row-${i}`;
+        const isHovered = this.hoveredScreenBoxId === rowId;
+        this.drawRoundedBox(
+          ctx,
+          listX,
+          y,
+          listW,
+          62,
+          10,
+          isSelected ? 'rgba(30, 58, 138, 0.88)' : 'rgba(30, 41, 59, 0.82)',
+          isHovered ? '#ffffff' : isSelected ? accent : 'rgba(148, 163, 184, 0.22)',
+          isSelected || isHovered ? 2.2 : 1
+        );
+        ctx.fillStyle = accent;
+        ctx.fillRect(listX, y + 8, 5, 46);
 
-      const items = feed.items.slice(0, 5);
-      if (items.length === 0) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 17px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(item.title.slice(0, 40), listX + 14, y + 25);
+
         ctx.fillStyle = '#cbd5e1';
-        ctx.font = '26px sans-serif';
-        ctx.fillText('No recent items found in this Google account.', 48, 230);
-      } else {
-        let y = 172;
-        for (const item of items) {
-          ctx.fillStyle = 'rgba(30, 41, 59, 0.85)';
-          ctx.fillRect(48, y, W - 96, 56);
-          ctx.fillStyle = accent;
-          ctx.fillRect(48, y, 6, 56);
+        ctx.font = '14px sans-serif';
+        ctx.fillText(item.detail.slice(0, 50), listX + 14, y + 48);
 
-          ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 20px sans-serif';
-          ctx.textAlign = 'left';
-          ctx.fillText(item.title.slice(0, 58), 68, y + 24);
-
-          ctx.fillStyle = '#cbd5e1';
-          ctx.font = '16px sans-serif';
-          ctx.fillText(item.detail.slice(0, 74), 68, y + 46);
-
-          if (item.meta) {
-            ctx.fillStyle = '#38bdf8';
-            ctx.font = 'bold 15px monospace';
-            ctx.textAlign = 'right';
-            ctx.fillText(item.meta.slice(0, 24), W - 64, y + 26);
-          }
-          y += 62;
+        if (item.meta) {
+          ctx.fillStyle = '#38bdf8';
+          ctx.font = 'bold 12px monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText(item.meta.slice(0, 14), listX + listW - 10, y + 23);
         }
+
+        this.addScreenHitbox(rowId, `Select: ${item.title.slice(0, 26)}`, listX, y, listW, 62, () => {
+          this.selectedItemIndex = i;
+          this.drawScreen();
+        });
+        y += 69;
+      }
+    }
+
+    // Right Rich Live Preview Card
+    this.drawRoundedBox(
+      ctx,
+      previewX,
+      previewY,
+      previewW,
+      previewH,
+      14,
+      'rgba(15, 23, 42, 0.92)',
+      accent,
+      1.8
+    );
+
+    if (svc === 'maps' || svc === 'earth') {
+      this.drawMapsRadarPreview(ctx, previewX, previewY, previewW, previewH, accent, selectedItem);
+    } else if (selectedItem?.tableRows && selectedItem.tableRows.length > 0) {
+      this.drawSheetsTablePreview(ctx, previewX, previewY, previewW, previewH, selectedItem);
+    } else if (selectedItem?.imageUrl) {
+      this.drawMediaImagePreview(ctx, previewX, previewY, previewW, previewH, selectedItem);
+    } else if (selectedItem) {
+      ctx.fillStyle = accent;
+      ctx.font = 'bold 19px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(selectedItem.title.slice(0, 36), previewX + 18, previewY + 34);
+
+      const body = selectedItem.fullText || selectedItem.detail;
+      const lines = this.wrapCanvasLines(ctx, body, previewW - 36, 12);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '15px sans-serif';
+      let ly = previewY + 66;
+      for (const line of lines) {
+        ctx.fillText(line, previewX + 18, ly);
+        ly += 22;
       }
     }
 
     ctx.textAlign = 'center';
     ctx.fillStyle = '#94a3b8';
-    ctx.font = '19px sans-serif';
+    ctx.font = '15px sans-serif';
     ctx.fillText(
-      'GAZE SCREEN 1.2s TO REFRESH  •  SHAKE HEAD LEFT-RIGHT TO RETURN TO HUB',
+      'GAZE / CLICK ANY ITEM OR BUTTON ABOVE  •  SHAKE HEAD LEFT-RIGHT TO RETURN HOME',
       W / 2,
-      H - 22
+      H - 16
     );
   }
 
-  private drawGoogleSuiteLaunchScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-    const accent = this.activeApp?.accentColor || '#4285F4';
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, '#070b19');
-    grad.addColorStop(1, '#172554');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, H);
+  private drawMediaImagePreview(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    item: WorkspaceFeedItem
+  ): void {
+    const img = this.getCachedImage(item.imageUrl);
+    const imgAreaH = h - 94;
+    if (img) {
+      const scale = Math.min((w - 28) / img.width, imgAreaH / img.height);
+      const dw = img.width * scale;
+      const dh = img.height * scale;
+      const dx = x + (w - dw) / 2;
+      const dy = y + 14 + (imgAreaH - dh) / 2;
+      ctx.drawImage(img, dx, dy, dw, dh);
+    } else {
+      ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+      ctx.fillRect(x + 14, y + 14, w - 28, imgAreaH);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Loading live media preview...', x + w / 2, y + 14 + imgAreaH / 2);
+    }
 
-    ctx.fillStyle = accent;
-    ctx.fillRect(0, 0, W, 10);
-
-    ctx.fillStyle = accent;
-    ctx.font = 'bold 22px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`INSTALLED GOOGLE ANDROID APP  •  ${this.activeApp?.packageId ?? ''}`, 54, 62);
-
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 52px sans-serif';
-    ctx.fillText(this.activeApp?.title ?? 'Google App', 54, 132);
-
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '24px sans-serif';
-    ctx.fillText(this.activeApp?.description.slice(0, 74) ?? '', 54, 184);
-
-    // Status Card inside Curved VR Screen
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-    ctx.fillRect(54, 224, W - 108, 178);
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 3;
-    ctx.strokeRect(54, 224, W - 108, 178);
-
-    ctx.fillStyle = '#34d399';
-    ctx.font = 'bold 28px sans-serif';
-    ctx.fillText('✓ INSTALLED ON DEVICE & READY IN VR', 84, 278);
-
+    ctx.font = 'bold 17px sans-serif';
+    ctx.fillText(item.title.slice(0, 38), x + 16, y + h - 54);
     ctx.fillStyle = '#cbd5e1';
-    ctx.font = '22px sans-serif';
-    ctx.fillText(`Package: ${this.activeApp?.packageId ?? ''}`, 84, 324);
-    ctx.fillText(
-      `Destination: ${this.activeApp?.webUrl ?? this.activeApp?.playStoreUrl ?? ''}`,
-      84,
-      362
-    );
+    ctx.font = '14px sans-serif';
+    ctx.fillText(item.detail.slice(0, 46), x + 16, y + h - 28);
 
-    ctx.textAlign = 'center';
+    if (item.videoId) {
+      const playId = 'g-preview-play';
+      this.drawRoundedBox(
+        ctx,
+        x + w - 126,
+        y + h - 46,
+        110,
+        32,
+        8,
+        'rgba(239, 68, 68, 0.85)',
+        this.hoveredScreenBoxId === playId ? '#ffffff' : '#fca5a5',
+        1.5
+      );
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('▶ Play VR', x + w - 71, y + h - 25);
+      this.addScreenHitbox(playId, `Play: ${item.title.slice(0, 24)}`, x + w - 126, y + h - 46, 110, 32, () => {
+        if (item.videoId) openYouTubePlayerOverlay(item.videoId, item.title);
+      });
+    }
+  }
+
+  private drawSheetsTablePreview(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    _h: number,
+    item: WorkspaceFeedItem
+  ): void {
+    ctx.fillStyle = '#34d399';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${item.title.slice(0, 32)} — Live Sheet`, x + 16, y + 30);
+
+    const rows = (item.tableRows ?? []).slice(0, 7);
+    const cols = 4;
+    const cellW = (w - 32) / cols;
+    const cellH = 38;
+    let ry = y + 48;
+
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cx = x + 16 + c * cellW;
+        ctx.fillStyle = r === 0 ? 'rgba(15, 157, 88, 0.28)' : 'rgba(30, 41, 59, 0.72)';
+        ctx.fillRect(cx, ry, cellW - 2, cellH - 2);
+        ctx.fillStyle = r === 0 ? '#a7f3d0' : '#e2e8f0';
+        ctx.font = r === 0 ? 'bold 13px sans-serif' : '13px monospace';
+        ctx.textAlign = 'left';
+        const val = rows[r]?.[c] ?? '';
+        ctx.fillText(val.slice(0, 11), cx + 6, ry + 23);
+      }
+      ry += cellH;
+    }
+  }
+
+  private drawMapsRadarPreview(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    accent: string,
+    selectedItem?: WorkspaceFeedItem
+  ): void {
+    const tel = this.sensors.getTelemetry();
+    const cx = x + w / 2;
+    const cy = y + 128;
+    const r = 88;
+
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 0.52, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Live rotating North / Compass heading beam
+    const rad = THREE.MathUtils.degToRad(tel.compassHeadingDeg - 90);
+    ctx.fillStyle = 'rgba(52, 211, 153, 0.25)';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, rad - 0.35, rad + 0.35);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = accent;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.fillStyle = '#38bdf8';
-    ctx.font = 'bold 22px sans-serif';
-    ctx.fillText(
-      'GAZE SCREEN OR NOD TO OPEN REAL APP  •  SHAKE HEAD LEFT-RIGHT TO EXIT',
-      W / 2,
-      H - 36
-    );
+    ctx.font = 'bold 15px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`HEADING ${tel.compassHeadingDeg}°`, cx, y + 28);
+
+    if (selectedItem) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText(selectedItem.title.slice(0, 36), x + 16, y + h - 84);
+      const lines = this.wrapCanvasLines(
+        ctx,
+        selectedItem.fullText || selectedItem.detail,
+        w - 32,
+        3
+      );
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '14px sans-serif';
+      let ly = y + h - 60;
+      for (const l of lines) {
+        ctx.fillText(l, x + 16, ly);
+        ly += 20;
+      }
+    }
   }
 
   private drawControlSchemeScreen(ctx: CanvasRenderingContext2D, W: number, H: number): void {
@@ -1675,10 +2660,13 @@ export class VRGameTheater extends xb.Script {
   }
 
   dispose(): void {
+    closeYouTubePlayerOverlay();
     if (this.unsubAuth) {
       this.unsubAuth();
       this.unsubAuth = null;
     }
+    this.imageCache.clear();
+    this.screenHitboxes.length = 0;
     this.stopCurrentGame();
     this.gradientCache.clear();
     this.screenTexture.dispose();

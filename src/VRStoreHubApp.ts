@@ -8,6 +8,7 @@ import {VRGameTheater} from './games/VRGameTheater.ts';
 import {HandGestureController, VRGestureAction} from './gestures/HandGestureController.ts';
 import {HeadGazeController} from './sensors/HeadGazeController.ts';
 import {SensorFusionTracker} from './sensors/SensorFusionTracker.ts';
+import {deviceHomeService} from './services/deviceHomeService.ts';
 import {
   disposeCatalogTextures,
   PLAY_STORE_CATALOG,
@@ -51,9 +52,13 @@ export class VRStoreHubApp extends xb.Script {
   private stereoHudBtn!: xb.UIButton;
   private gazeHudBtn!: xb.UIButton;
   private controlsGuideBtn!: xb.UIButton;
+  private mirrorScreenBtn!: xb.UIButton;
   private exitGameBtn!: xb.UIButton;
   private cinemaPlayBtn!: xb.UIButton;
   private cinemaDimBtn!: xb.UIButton;
+  private gPrevBtn!: xb.UIButton;
+  private gNextBtn!: xb.UIButton;
+  private gActionBtn!: xb.UIButton;
   private togglePanelsBtn!: xb.UIButton;
   private muteBtn!: xb.UIButton;
   private panelsVisible = true;
@@ -72,6 +77,8 @@ export class VRStoreHubApp extends xb.Script {
 
   init(): void {
     xb.ui.theme = 'grayGlass';
+
+    deviceHomeService.init();
 
     this.add(this.vrEngine);
     this.add(this.sensors);
@@ -130,6 +137,7 @@ export class VRStoreHubApp extends xb.Script {
         this.theater.triggerLocomotionStep(running, moveDirection),
       onLocomotionFrame: (state, moveDirection, crouching, speedMps, jumpHeightM) =>
         this.theater.updateLocomotionFrame(state, moveDirection, crouching, speedMps, jumpHeightM),
+      getHoveredScreenHint: (hitPoint) => this.theater.updateScreenHover(hitPoint),
       onStatusUpdate: (label) => {
         if (this.hudGestureText) this.hudGestureText.text = label;
       },
@@ -158,6 +166,9 @@ export class VRStoreHubApp extends xb.Script {
     this.storeCard.position.set(0.96, 1.36, -0.94);
     this.storeCard.rotation.y = -0.56;
     this.add(this.storeCard);
+
+    this.theater.setInstalledAppsProvider(() => this.storeCard.getInstalledApps());
+    this.theater.setAppLauncher((app) => this.launchAppDirectlyIntoVR(app));
 
     // Center Card: VR App Launcher (Installed VR Icons, Direct VR Launch & Uninstall Manager)
     this.launcherCard = new VRLauncherCard(
@@ -350,17 +361,18 @@ export class VRStoreHubApp extends xb.Script {
   }
 
   private handleTheaterScreenTouch(hitPoint: THREE.Vector3): void {
+    if (this.theater.handleScreenClickAt(hitPoint)) {
+      return;
+    }
     const mode = this.theater.getMode();
-    if (mode === 'hub' || mode === 'control-scheme') {
+    if (mode === 'control-scheme') {
       this.sound.playClick();
       const firstGame =
         PLAY_STORE_CATALOG.find((a) => a.id === 'cosmic-blaster') ?? PLAY_STORE_CATALOG[0];
       this.theater.launchApp(firstGame);
-    } else if (mode === 'google-workspace') {
+    } else if (mode === 'google-workspace' || mode === 'google-suite-launch') {
       this.sound.playClick();
-      void this.theater.refreshWorkspaceApp();
-    } else if (mode === 'google-suite-launch') {
-      this.theater.openActiveGoogleAppExternally();
+      this.theater.refreshActiveGoogleApp();
     } else if (mode === 'play-browser') {
       this.sound.playClick();
       this.browserVisible = true;
@@ -539,12 +551,51 @@ export class VRStoreHubApp extends xb.Script {
       },
     });
 
+    this.mirrorScreenBtn = new xb.UIButton({
+      label: 'Mirror Device',
+      icon: 'cast',
+      onClick: () => {
+        this.sound.playClick();
+        if (this.theater.getMode() !== 'hub') {
+          this.theater.exitToHub();
+        }
+        void deviceHomeService.toggleDeviceScreenMirror();
+      },
+    });
+
     this.exitGameBtn = new xb.UIButton({
       label: 'Exit App',
       icon: 'stop_circle',
       visible: false,
       onClick: () => {
         this.theater.exitToHub();
+      },
+    });
+
+    this.gPrevBtn = new xb.UIButton({
+      label: 'Prev Item',
+      icon: 'chevron_left',
+      visible: false,
+      onClick: () => {
+        this.theater.cycleGoogleItem(-1);
+      },
+    });
+
+    this.gNextBtn = new xb.UIButton({
+      label: 'Next Item',
+      icon: 'chevron_right',
+      visible: false,
+      onClick: () => {
+        this.theater.cycleGoogleItem(1);
+      },
+    });
+
+    this.gActionBtn = new xb.UIButton({
+      label: 'Open / Play',
+      icon: 'open_in_new',
+      visible: false,
+      onClick: () => {
+        void this.theater.triggerGooglePrimaryAction();
       },
     });
 
@@ -643,6 +694,7 @@ export class VRStoreHubApp extends xb.Script {
             this.browserHudBtn,
             this.gazeHudBtn,
             this.stereoHudBtn,
+            this.mirrorScreenBtn,
             this.controlsGuideBtn,
             this.exitGameBtn,
           ],
@@ -659,6 +711,9 @@ export class VRStoreHubApp extends xb.Script {
             this.camHeadHudBtn,
             this.camHandsHudBtn,
             this.arViewHudBtn,
+            this.gPrevBtn,
+            this.gNextBtn,
+            this.gActionBtn,
             this.cinemaPlayBtn,
             this.cinemaDimBtn,
             recenterBtn,
@@ -692,10 +747,13 @@ export class VRStoreHubApp extends xb.Script {
     if (!app) {
       this.activeSessionAppName = null;
       this.launcherCard.setActiveRunningApp(null);
-      this.hudTitleText.text = 'VR Hub • Back-Cam Auto: Walk/Run/Jump/Crouch/Turn + 1s Gaze';
+      this.hudTitleText.text = 'Device Home Screen • Gaze/Click any App on Curved Screen or Mirror Device';
       this.exitGameBtn.visible = false;
       this.cinemaPlayBtn.visible = false;
       this.cinemaDimBtn.visible = false;
+      this.gPrevBtn.visible = false;
+      this.gNextBtn.visible = false;
+      this.gActionBtn.visible = false;
       this.setPanelsVisible(true);
       return;
     }
@@ -704,8 +762,21 @@ export class VRStoreHubApp extends xb.Script {
     this.launcherCard.setActiveRunningApp(app.id);
     this.exitGameBtn.visible = true;
     const isCinema = app.playableMode === 'cinema-deck';
+    const isGoogle =
+      app.playableMode === 'google-workspace' || app.playableMode === 'google-suite-launch';
     this.cinemaPlayBtn.visible = isCinema;
     this.cinemaDimBtn.visible = isCinema;
+    this.gPrevBtn.visible = isGoogle;
+    this.gNextBtn.visible = isGoogle;
+    this.gActionBtn.visible = isGoogle;
+    if (isGoogle) {
+      this.gActionBtn.label =
+        app.googleService === 'photos'
+          ? 'Pick Photos'
+          : app.googleService === 'youtube' || app.googleService === 'google-tv'
+            ? 'Watch Video'
+            : 'Open / Launch';
+    }
 
     if (app.playableMode === 'cosmic-blaster') {
       this.hudTitleText.text = `${app.title} • Score: ${score}`;
@@ -744,6 +815,12 @@ export class VRStoreHubApp extends xb.Script {
     const targetStereoLabel = stereoOn ? 'VR SBS: ON' : 'VR SBS: OFF';
     if (this.stereoHudBtn.label !== targetStereoLabel) {
       this.stereoHudBtn.label = targetStereoLabel;
+    }
+    const targetMirrorLabel = deviceHomeService.isScreenMirrorActive()
+      ? 'Stop Mirror'
+      : 'Mirror Device';
+    if (this.mirrorScreenBtn.label !== targetMirrorLabel) {
+      this.mirrorScreenBtn.label = targetMirrorLabel;
     }
     this.spatialDock.setStereoState(stereoOn);
 
@@ -785,6 +862,7 @@ export class VRStoreHubApp extends xb.Script {
   }
 
   dispose(): void {
+    deviceHomeService.stopDeviceScreenMirror();
     if (this.unsubscribeQuality) {
       this.unsubscribeQuality();
       this.unsubscribeQuality = null;
